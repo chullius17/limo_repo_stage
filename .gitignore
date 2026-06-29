@@ -1,0 +1,26 @@
+# --- Cartelle di build e installazione ROS (ovunque siano nelle sottocartelle) ---
+**/build/
+**/devel/
+**/install/
+**/log/
+
+# --- Cache di Python (generate dai nodi ROS2 o script utili) ---
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# --- File di configurazione locali dell'IDE ---
+.vscode/
+.idea/
+*.swp
+
+# --- File multimediali pesanti (video di test, log di simulazione) ---
+*.mp4
+*.avi
+*.bag
+*.db3
+
+# --- File di sistema ---
+.DS_Store

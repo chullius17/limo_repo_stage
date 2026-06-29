@@ -1,0 +1,21 @@
+material vrc/circuit
+{
+    technique
+    {
+        pass
+        {
+            ambient 0.8 0.8 0.8 1.0
+            diffuse 0.8 0.8 0.8 1.0
+            specular 0.0 0.0 0.0 1.0 0.0
+
+            texture_unit
+            {
+                // The filename must exactly match your image in the textures folder
+                texture circuit.png
+                // Scales the texture over the visual geometry (1 1 means stretch to fit)
+                filtering anistropic
+                max_anisotropy 16
+            }
+        }
+    }
+}

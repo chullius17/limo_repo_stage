@@ -1,0 +1,10 @@
+catkin_ws/build/
+catkin_ws/devel/
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+.vscode/
+ros2_ws/useful_scripts
+*.mp4
+*.avi
+*.jpg

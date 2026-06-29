@@ -1,0 +1,19 @@
+ekf_filter_node:
+  ros__parameters:
+    frequency: 30.0
+    sensor_timeout: 0.1
+    two_d_mode: true
+
+    # Definizione dei frame (REP 105)
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_link
+    world_frame: odom # L'EKF pubblicherà la trasformata map -> odom
+
+    # # --- ODOMETRIA DELLE RUOTE (LIMO) ---
+    odom0: /odom
+    odom0_config: [false, false, false,
+                   false, false, false,
+                   true,  true,  false,  # Velocità lineare X e Y
+                   false, false, true,   # Velocità angolare Yaw rate
+                   false, false, false]

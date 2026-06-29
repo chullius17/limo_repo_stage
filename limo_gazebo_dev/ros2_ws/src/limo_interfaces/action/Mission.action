@@ -1,0 +1,13 @@
+# Mission.action
+
+geometry_msgs/PoseStamped[] goals
+
+---
+
+bool success
+string message
+
+---
+
+geometry_msgs/PoseStamped current_goal
+string state
