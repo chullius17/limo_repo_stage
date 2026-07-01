@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 4
+names: ['Dashed', 'Parking', 'Solid', 'Street']
+
+roboflow:
+  workspace: chulius17s-workspace
+  project: chulius17s-workspace
+  version: dataset
+  license: Private
+  url: https://app.roboflow.com/chulius17s-workspace/chulius17s-workspace/dataset

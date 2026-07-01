@@ -1,0 +1,6 @@
+# Request
+geometry_msgs/PoseStamped[] goals
+---
+# Response
+geometry_msgs/PoseStamped[] ordered_goals
+nav_msgs/Path[] paths

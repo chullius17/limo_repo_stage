@@ -1,0 +1,20 @@
+# Goal
+geometry_msgs/PoseStamped[] ordered_goals # Array of ordered target goals
+nav_msgs/Path[] paths                     # Corresponding A* paths for each goal
+---
+# Result
+float64[] distance_errors     # Full history of distance errors during execution
+float64[] angular_errors      # Full history of angular errors during execution  
+float64[] linear_velocities   # Full history of commanded linear velocities (v*)
+float64[] angular_velocities  # Full history of commanded angular velocities (gamma)
+float64[] goal_reach_times    # Timestamps when each goal was successfully reached
+---
+# Feedback
+int32 current_goal_index                # Index of the goal currently being executed
+float64 distance_error                  # Current distance error to the path
+float64 angular_error                   # Current angular error to the path
+float64 linear_velocity                 # Current linear velocity command being published
+float64 angular_velocity                # Current angular velocity command being published
+float64 distance_to_next_goal           # Direct distance remaining to the final goal pose
+
+geometry_msgs/PoseStamped next_goal_pose

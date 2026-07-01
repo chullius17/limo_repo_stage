@@ -1,0 +1,366 @@
+========================================================================
+DYNAMIC MATRICES — LIMO ACKERMANN  (planar base + wheel joints)
+========================================================================
+
+  Root joint  : JointModelPlanar()  — 3 DOF  (x, y, θ_z)
+  Wheel/steer : 4 continuous + 2 revolute  — 6 DOF
+  Total  nq   : 14   (planar needs 4 scalars: x, y, cos θ, sin θ)
+  Total  nv   : 9   (3 planar velocities + 6 joint velocities)
+
+  Equation of motion:  M(q)·v̇ + C(q,v)·v + g(q) + D·v + f·sign(v) = τ
+    where  D = diag(damping)   [viscous friction matrix]
+           f = friction vector  [Coulomb / dry friction]
+
+========================================================================
+CHASSIS PARAMETERS LUMPED INTO THE PLANAR ROOT JOINT
+========================================================================
+
+  Source URDF link  : inertial_link  (fixed child of base_link)
+  Total chassis mass: 2.1557 kg
+  Ixx (roll)        : 0.24  kg·m²
+  Iyy (pitch)       : 0.96  kg·m²
+  Izz (yaw)         : 0.96  kg·m²  ← active in planar motion
+
+  Pinocchio automatically propagates the inertia of ALL fixed-child
+  links (base_link, inertial_link, laser_link, imu_link, camera_link)
+  to the first movable ancestor, which is the planar root joint.
+  Therefore M[0:3, 0:3] reflects the TOTAL lumped inertia of the
+  chassis assembly, not just the URDF inertial_link values.
+
+========================================================================
+ACTIVE JOINTS IN THE MODEL
+========================================================================
+
+  ► root_joint
+      Type          : Planar (SE2 root)
+      Axes          : X, Y, Z-rot
+      Parent link   : world
+      Child link    : base_footprint
+      Mass [kg]     : 2.1557
+      Izz [kg·m²]   : 0.96
+      q indices     : 0 .. 3  (nq=4)
+      v indices     : 0 .. 2  (nv=3)
+      Notes         : Virtual root joint added by JointModelPlanar(). Represents the 2-D rigid-body motion of the whole chassis: translation (x, y) + yaw (θ_z). Inertia comes from inertial_link + base_link + all fixed sensor links.
+
+  ► left_steering_hinge_wheel
+      Type          : Revolute (steering)
+      Axes          : Z
+      Parent link   : base_link
+      Child link    : left_steering_hinge
+      Position      : ( 0.1,  0.07, -0.101) m from base_link
+      Mass [kg]     : 0.25
+      Izz [kg·m²]   : 0.00525
+      q indices     : 4 .. 4  (nq=1)
+      v indices     : 3 .. 3  (nv=1)
+      Notes         : Left Ackermann steering hinge. Limits ±30° (±0.5236 rad), max effort 5 Nm.
+
+  ► front_left_wheel
+      Type          : Continuous (wheel)
+      Axes          : Y
+      Parent link   : left_steering_hinge
+      Child link    : front_left_wheel_link
+      Position      : (0.0, 0.0, 0.0) m from left_steering_hinge
+      Mass [kg]     : 0.25
+      Izz [kg·m²]   : 0.00525
+      q indices     : 5 .. 6  (nq=2)
+      v indices     : 4 .. 4  (nv=1)
+      Notes         : Steering front left wheel. Inherits orientation from the parent hinge.
+
+  ► rear_left_wheel
+      Type          : Continuous (wheel)
+      Axes          : Y
+      Parent link   : base_link
+      Child link    : rear_left_wheel_link
+      Position      : (-0.1,  0.07, -0.101) m from base_link
+      Mass [kg]     : 0.5
+      Izz [kg·m²]   : 0.01055
+      q indices     : 7 .. 8  (nq=2)
+      v indices     : 5 .. 5  (nv=1)
+      Notes         : Rear left drive wheel. Free spin, velocity-controlled.
+
+  ► rear_right_wheel
+      Type          : Continuous (wheel)
+      Axes          : -Y
+      Parent link   : base_link
+      Child link    : rear_right_wheel_link
+      Position      : (-0.1, -0.07, -0.101) m from base_link
+      Mass [kg]     : 0.5
+      Izz [kg·m²]   : 0.01055
+      q indices     : 9 .. 10  (nq=2)
+      v indices     : 6 .. 6  (nv=1)
+      Notes         : Rear right drive wheel. RPY=(π,0,0) → -Y axis for sign consistency.
+
+  ► right_steering_hinge_wheel
+      Type          : Revolute (steering)
+      Axes          : -Z
+      Parent link   : base_link
+      Child link    : right_steering_hinge
+      Position      : ( 0.1, -0.07, -0.101) m from base_link
+      Mass [kg]     : 0.25
+      Izz [kg·m²]   : 0.00525
+      q indices     : 11 .. 11  (nq=1)
+      v indices     : 7 .. 7  (nv=1)
+      Notes         : Right Ackermann steering hinge. RPY=(π,0,0) → -Z axis for consistency.
+
+  ► front_right_wheel
+      Type          : Continuous (wheel)
+      Axes          : -Y
+      Parent link   : right_steering_hinge
+      Child link    : front_right_wheel_link
+      Position      : (0.0, 0.0, 0.0) m from right_steering_hinge
+      Mass [kg]     : 0.25
+      Izz [kg·m²]   : 0.00525
+      q indices     : 12 .. 13  (nq=2)
+      v indices     : 8 .. 8  (nv=1)
+      Notes         : Steering front right wheel. Axis inverted w.r.t. left side.
+
+========================================================================
+VECTOR q — NEUTRAL CONFIGURATION  (nq = 14)
+========================================================================
+
+  The planar root joint stores [x, y, cos(θ), sin(θ)]  →  nq = 4.
+  Each continuous wheel stores [cos(φ), sin(φ)]         →  nq = 2.
+  Each revolute steering hinge stores [δ]               →  nq = 1.
+
+  Index  Value     Joint / Meaning
+  -----  --------  ------------------------------------------------
+  q[ 0]  +0.0000  root_joint → x      [m]      — chassis position along world X axis
+  q[ 1]  +0.0000  root_joint → y      [m]      — chassis position along world Y axis
+  q[ 2]  +1.0000  root_joint → cos(θ) [adim]   — cosine of chassis yaw angle (θ=0 → pointing +X)
+  q[ 3]  +0.0000  root_joint → sin(θ) [adim]   — sine   of chassis yaw angle
+  q[ 4]  +0.0000  left_steering_hinge_wheel → θ [rad]  [Revolute (steering)]
+  q[ 5]  +1.0000  front_left_wheel → cos(θ)  [Continuous (wheel)]
+  q[ 6]  +0.0000  front_left_wheel → sin(θ)  (θ=0 in neutral)
+  q[ 7]  +1.0000  rear_left_wheel → cos(θ)  [Continuous (wheel)]
+  q[ 8]  +0.0000  rear_left_wheel → sin(θ)  (θ=0 in neutral)
+  q[ 9]  +1.0000  rear_right_wheel → cos(θ)  [Continuous (wheel)]
+  q[10]  +0.0000  rear_right_wheel → sin(θ)  (θ=0 in neutral)
+  q[11]  +0.0000  right_steering_hinge_wheel → θ [rad]  [Revolute (steering)]
+  q[12]  +1.0000  front_right_wheel → cos(θ)  [Continuous (wheel)]
+  q[13]  +0.0000  front_right_wheel → sin(θ)  (θ=0 in neutral)
+
+========================================================================
+VECTOR v — GENERALIZED VELOCITIES (zero)  (nv = 9)
+========================================================================
+
+  The planar root joint velocity is [ẋ, ẏ, ω_z]  expressed in the
+  WORLD frame (local-world-aligned convention in Pinocchio).
+  Wheel/hinge velocities are angular rates around their local axes.
+
+  Index  Value     Joint / Meaning
+  -----  --------  ------------------------------------------------
+  v[ 0]  +0.0000  root_joint → ẋ      [m/s]    — chassis linear velocity along world X
+  v[ 1]  +0.0000  root_joint → ẏ      [m/s]    — chassis linear velocity along world Y
+  v[ 2]  +0.0000  root_joint → ω_z    [rad/s]  — chassis yaw rate (positive = counter-clockwise)
+  v[ 3]  +0.0000  left_steering_hinge_wheel → dθ/dt [rad/s]  axis Z  [Revolute (steering)]
+  v[ 4]  +0.0000  front_left_wheel → dθ/dt [rad/s]  axis Y  [Continuous (wheel)]
+  v[ 5]  +0.0000  rear_left_wheel → dθ/dt [rad/s]  axis Y  [Continuous (wheel)]
+  v[ 6]  +0.0000  rear_right_wheel → dθ/dt [rad/s]  axis -Y  [Continuous (wheel)]
+  v[ 7]  +0.0000  right_steering_hinge_wheel → dθ/dt [rad/s]  axis -Z  [Revolute (steering)]
+  v[ 8]  +0.0000  front_right_wheel → dθ/dt [rad/s]  axis -Y  [Continuous (wheel)]
+
+========================================================================
+MASS MATRIX M(q)  [kg / kg·m²]  —  9×9
+========================================================================
+
+  Structure of M in the planar-base model:
+
+        [ M_chassis(3×3)  |  M_coupling(3×6) ]
+    M = [ ----------------+-----------------  ]
+        [ M_coupling^T    |  M_wheels(6×6)   ]
+
+  M_chassis  : mass/inertia of the whole chassis body.
+               Diagonal entries ≈ [total_mass, total_mass, Izz_total].
+               Off-diagonal entries arise from wheel CoM offsets.
+  M_coupling : dynamic coupling between chassis motion and wheel spin.
+               Non-zero if wheel CoM is offset from its rotation axis.
+  M_wheels   : diagonal, each entry = wheel/hinge inertia around its axis.
+
+
+  M(q) [kg / kg·m²]  —  9×9 matrix:
+[[ 4.3657  0.      0.      0.      0.      0.      0.      0.      0.    ]
+   [ 0.      4.3657  0.0374  0.      0.      0.      0.      0.      0.    ]
+   [ 0.      0.0374  1.0337  0.021   0.      0.     -0.      0.021  -0.    ]
+   [ 0.      0.      0.021   0.0105  0.      0.      0.      0.      0.    ]
+   [ 0.      0.      0.      0.      0.0003  0.      0.      0.      0.    ]
+   [ 0.      0.      0.      0.      0.      0.0008  0.      0.      0.    ]
+   [ 0.      0.     -0.      0.      0.      0.      0.0008  0.      0.    ]
+   [ 0.      0.      0.021   0.      0.      0.      0.      0.0105  0.    ]
+   [ 0.      0.     -0.      0.      0.      0.      0.      0.      0.0003]]
+
+  Diagonal breakdown (physical interpretation):
+  DOF  Value        Joint                           Physical meaning
+  ---  -----------  ------------------------------  ----------------------------------------
+    0  +4.365700   root_joint                      M_xx = 4.3657  chassis total mass (x direction) [kg]
+    1  +4.365700   root_joint                      M_yy = 4.3657  chassis total mass (y direction) [kg]
+    2  +1.033669   root_joint                      M_zz = 1.0337  chassis yaw inertia (Izz lumped) [kg·m²]
+        M_xy = 0.0000  M_xz = 0.0000  M_yz = 0.0374  (off-diagonal planar block)
+    3  +0.010500   left_steering_hinge_wheel       Izz from URDF ≈ 0.00525
+    4  +0.000350   front_left_wheel                Izz from URDF ≈ 0.00525
+    5  +0.000750   rear_left_wheel                 Izz from URDF ≈ 0.01055
+    6  +0.000750   rear_right_wheel                Izz from URDF ≈ 0.01055
+    7  +0.010500   right_steering_hinge_wheel      Izz from URDF ≈ 0.00525
+    8  +0.000350   front_right_wheel               Izz from URDF ≈ 0.00525
+
+========================================================================
+CORIOLIS MATRIX C(q,v)  [kg·m/s or kg·m²/s]  —  9×9
+========================================================================
+
+  C(q,v)·v contains centrifugal and Coriolis terms.
+  With v = 0 all terms vanish by definition.
+  At non-zero velocity, the planar block (rows/cols 0-2) will show
+  gyroscopic coupling between chassis yaw rate and wheel spin.
+
+
+  C(q,v) [kg·m/s or kg·m²/s]  —  9×9 matrix:
+[[0. 0. 0. 0. 0. 0. 0. 0. 0.]
+   [0. 0. 0. 0. 0. 0. 0. 0. 0.]
+   [0. 0. 0. 0. 0. 0. 0. 0. 0.]
+   [0. 0. 0. 0. 0. 0. 0. 0. 0.]
+   [0. 0. 0. 0. 0. 0. 0. 0. 0.]
+   [0. 0. 0. 0. 0. 0. 0. 0. 0.]
+   [0. 0. 0. 0. 0. 0. 0. 0. 0.]
+   [0. 0. 0. 0. 0. 0. 0. 0. 0.]
+   [0. 0. 0. 0. 0. 0. 0. 0. 0.]]
+
+  Diagonal breakdown (physical interpretation):
+  DOF  Value        Joint                           Physical meaning
+  ---  -----------  ------------------------------  ----------------------------------------
+    0  +0.000000   root_joint                      M_xx = 0.0000  chassis total mass (x direction) [kg]
+    1  +0.000000   root_joint                      M_yy = 0.0000  chassis total mass (y direction) [kg]
+    2  +0.000000   root_joint                      M_zz = 0.0000  chassis yaw inertia (Izz lumped) [kg·m²]
+        M_xy = 0.0000  M_xz = 0.0000  M_yz = 0.0000  (off-diagonal planar block)
+    3  +0.000000   left_steering_hinge_wheel       Izz from URDF ≈ 0.00525
+    4  +0.000000   front_left_wheel                Izz from URDF ≈ 0.00525
+    5  +0.000000   rear_left_wheel                 Izz from URDF ≈ 0.01055
+    6  +0.000000   rear_right_wheel                Izz from URDF ≈ 0.01055
+    7  +0.000000   right_steering_hinge_wheel      Izz from URDF ≈ 0.00525
+    8  +0.000000   front_right_wheel               Izz from URDF ≈ 0.00525
+
+========================================================================
+GRAVITY VECTOR g(q)  [N or N·m]  —  length 9
+========================================================================
+
+  For a robot moving on a HORIZONTAL plane, gravity acts along -Z
+  (world frame).  The planar DOF (x, y, θ_z) are perpendicular to
+  gravity, so g[0], g[1], g[2] = 0.
+  Wheel/hinge CoMs lie on their rotation axes, so g[3..8] = 0 too.
+
+  Index  Value [N or N·m]  Joint / Meaning
+  -----  ---------------  ------------------------------------------------
+  g[ 0]  +0.000000        root_joint → force  along X  [N]   — gravity has no X component on a flat robot
+  g[ 1]  +0.000000        root_joint → force  along Y  [N]   — gravity has no Y component on a flat robot
+  g[ 2]  +0.000000        root_joint → torque around Z [N·m] — gravity has no yaw torque (CoM on Z axis)
+  g[ 3]  +0.000000        left_steering_hinge_wheel → gravitational torque [N·m]  (0 because CoM is on rotation axis)
+  g[ 4]  +0.000000        front_left_wheel → gravitational torque [N·m]  (0 because CoM is on rotation axis)
+  g[ 5]  +0.000000        rear_left_wheel → gravitational torque [N·m]  (0 because CoM is on rotation axis)
+  g[ 6]  +0.000000        rear_right_wheel → gravitational torque [N·m]  (0 because CoM is on rotation axis)
+  g[ 7]  +0.000000        right_steering_hinge_wheel → gravitational torque [N·m]  (0 because CoM is on rotation axis)
+  g[ 8]  +0.000000        front_right_wheel → gravitational torque [N·m]  (0 because CoM is on rotation axis)
+
+========================================================================
+FRICTION PARAMETERS  (from URDF <dynamics> tags)
+========================================================================
+
+  Source URDF tags:
+    Steering hinges : <dynamics damping="1.0" friction="2.0"/>
+    Wheels          : no <dynamics> tag → damping=0, friction=0
+    Planar root     : virtual joint, no friction
+
+  Complete equation of motion with friction:
+
+    M(q)·v̇  =  τ  −  C(q,v)·v  −  g(q)  −  D·v  −  f·sign(v)
+
+  where:
+    D·v        = viscous friction  (linear in velocity)
+    f·sign(v)  = Coulomb / dry friction  (nonlinear, direction-dependent)
+
+  Per-DOF friction breakdown:
+  --------------------------------------------------------------------
+  DOF   Joint                              damping b [N·m·s/rad]    friction f [N·m]
+  --------------------------------------------------------------------
+  0     root_joint → ẋ  (x vel)                           0.0000              0.0000
+  1     root_joint → ẏ  (y vel)                           0.0000              0.0000
+  2     root_joint → ω_z (yaw)                            0.0000              0.0000
+  3     left_steering_hinge_wheel                         1.0000              2.0000
+  4     front_left_wheel                                  0.0000              0.0000
+  5     rear_left_wheel                                   0.0000              0.0000
+  6     rear_right_wheel                                  0.0000              0.0000
+  7     right_steering_hinge_wheel                        1.0000              2.0000
+  8     front_right_wheel                                 0.0000              0.0000
+  --------------------------------------------------------------------
+
+  Physical meaning of each friction term:
+
+  VISCOUS (D·v):
+    Models bearing drag and fluid resistance. Proportional to velocity.
+    In state-space form adds a linear damping term: effectively
+    increases the denominator of the closed-loop transfer function.
+    Only non-zero for steering hinges (b = 1.0 N·m·s/rad).
+
+  COULOMB (f·sign(v)):
+    Models static/kinetic friction at the joint. Constant magnitude,
+    direction opposes motion. Creates a dead-zone around v=0.
+    Only non-zero for steering hinges (f = 2.0 N·m).
+    NOTE: at v=0 the sign function is discontinuous; in simulation
+    use a smoothed approximation: sign(v) ≈ tanh(v / v_eps).
+
+  WHEEL ROLLING FRICTION:
+    The URDF declares mu1=10, mu2=10 for Gazebo contact simulation,
+    but these are contact coefficients for the physics engine, NOT
+    joint-level friction. They are NOT available in model.friction.
+    To model rolling resistance analytically, add manually:
+      F_roll = C_rr · m_wheel · g_z · sign(v_wheel)
+    with C_rr ≈ 0.01..0.05 for rubber on hard floor.
+
+========================================================================
+RAW MATRICES FOR MATLAB (copy-paste)
+========================================================================
+
+M = [4.365700, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000;
+  0.000000, 4.365700, 0.037400, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000;
+  0.000000, 0.037400, 1.033669, 0.021000, 0.000000, 0.000000, -0.000000, 0.021000, -0.000000;
+  0.000000, 0.000000, 0.021000, 0.010500, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000;
+  0.000000, 0.000000, 0.000000, 0.000000, 0.000350, 0.000000, 0.000000, 0.000000, 0.000000;
+  0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000750, 0.000000, 0.000000, 0.000000;
+  0.000000, 0.000000, -0.000000, 0.000000, 0.000000, 0.000000, 0.000750, 0.000000, 0.000000;
+  0.000000, 0.000000, 0.021000, 0.000000, 0.000000, 0.000000, 0.000000, 0.010500, 0.000000;
+  0.000000, 0.000000, -0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000350];
+C = [0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000;
+  0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000;
+  0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000;
+  0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000;
+  0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000;
+  0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000;
+  0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000;
+  0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000;
+  0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000];
+g = [[0., 0., 0., 0., 0., 0., 0., 0., 0.]]';
+D = [0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000;
+  0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000;
+  0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000;
+  0.000000, 0.000000, 0.000000, 1.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000;
+  0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000;
+  0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000;
+  0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000;
+  0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 1.000000, 0.000000;
+  0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000];
+f_coulomb = [[0., 0., 0., 2., 0., 0., 0., 2., 0.]]';
+
+% Usage in MATLAB:
+%   v_dot = M \ (tau - C*v - g - D*v - f_coulomb.*sign(v));
+%   For simulation near v=0, replace sign(v) with tanh(v/v_eps),
+%   e.g. v_eps = 0.01 rad/s to avoid discontinuity.
+
+
+% DOF legend (v vector, length 9):
+%   v(1) = ẋ      [m/s]    — chassis linear velocity along world X
+%   v(2) = ẏ      [m/s]    — chassis linear velocity along world Y
+%   v(3) = ω_z    [rad/s]  — chassis yaw rate (positive = counter-clockwise)
+%   v(4) = left_steering_hinge_wheel  dθ/dt [rad/s]  axis Z
+%   v(5) = front_left_wheel  dθ/dt [rad/s]  axis Y
+%   v(6) = rear_left_wheel  dθ/dt [rad/s]  axis Y
+%   v(7) = rear_right_wheel  dθ/dt [rad/s]  axis -Y
+%   v(8) = right_steering_hinge_wheel  dθ/dt [rad/s]  axis -Z
+%   v(9) = front_right_wheel  dθ/dt [rad/s]  axis -Y
+

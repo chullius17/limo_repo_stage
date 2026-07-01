@@ -1,0 +1,13 @@
+# Request
+float64[] distance_errors
+float64[] angular_errors
+float64[] linear_velocities
+float64[] angular_velocities
+float64[] goal_reach_times   # timestamp [s] dall'inizio missione per ogni goal
+int32     n_goals
+string    output_dir          # directory dove salvare i jpg (es. /tmp/mission_plots)
+---
+# Response
+bool     success
+string[] output_paths         # percorsi dei jpg generati
+string   message
