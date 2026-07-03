@@ -28,6 +28,7 @@ setup(
             'bev_node = cv_package.bev:main',
             'lane_detector = cv_package.lane_detector:main',
             'boundaries = cv_package.boundary_extractor:main',
+            'trt_builder = cv_package.trt_builder:main',
         ],
     },
 )

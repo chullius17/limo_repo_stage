@@ -1,0 +1,9 @@
+<launch>
+    <include file="$(find limo_bringup)/launch/limo_start.launch" />
+
+    <node name="camera_image_republisher" 
+          pkg="image_transport" 
+          type="republish" 
+          args="raw in:=/camera/color/image_raw compressed out:=/camera/color/image_raw" 
+          output="screen" />
+</launch>
