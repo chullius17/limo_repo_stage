@@ -18,9 +18,9 @@ class BirdPerspective(Node):
         self.depth_img = None
         self.fx = None
 
-        self.rgb_sub = self.create_subscription(Image, '/detection/lines_and_curbs', self.rgb_callback, 10)
-        self.info_sub = self.create_subscription(CameraInfo, '/limo/color/camera_info', self.camera_info_callback, 10)
-        self.depth_sub = self.create_subscription(Image, '/limo/depth/image_raw', self.depth_callback, 10)
+        self.rgb_sub = self.create_subscription(Image, '/detection/lines_and_curbs/raw', self.rgb_callback, 10)
+        self.info_sub = self.create_subscription(CameraInfo, '/camera/color/camera_info', self.camera_info_callback, 10)
+        self.depth_sub = self.create_subscription(Image, '/camera/depth/image_raw', self.depth_callback, 10)
 
         self.bird_pub = self.create_publisher(Image, '/limo/color/image_raw_bird_perspective', 10)
 

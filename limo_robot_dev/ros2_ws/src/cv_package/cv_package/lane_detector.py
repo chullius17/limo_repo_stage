@@ -108,9 +108,8 @@ class LaneDetector(Node):
         self.window_size = 100
         self.telemetry_stats = {
             '1_cv_bridge': deque(maxlen=self.window_size),
-            '2_preprocessing_cpu': deque(maxlen=self.window_size),
             '3_gpu_h2d_raw': deque(maxlen=self.window_size),
-            '3b_gpu_preprocessing': deque(maxlen=self.window_size),
+            '3b_gpu_resize_preprocess': deque(maxlen=self.window_size),
             '4_gpu_inference': deque(maxlen=self.window_size),
             '5_gpu_d2h': deque(maxlen=self.window_size),
             '6_post_filter': deque(maxlen=self.window_size),
@@ -134,25 +133,62 @@ class LaneDetector(Node):
         self.pub_thread = threading.Thread(target=self._publish_worker, daemon=True)
         self.pub_thread.start()
 
-        # --- CUDA KERNEL FOR GPU PREPROCESSING ---
+        # --- OPTIMIZATION #5: FUSED GPU RESIZE + BGR2RGB + NORMALIZE KERNEL ---
+        # Prima: cv2.resize su CPU (single-thread, spesso 3-8ms su Cortex-A57)
+        # seguito da upload di un buffer gia' 448x448 e da un kernel separato
+        # di solo preprocessing. Ora: upload del frame RAW a risoluzione camera
+        # (H_in x W_in) e resize bilineare + BGR->RGB planar + normalizzazione
+        # fusi in un unico kernel eseguito interamente su GPU. Elimina lo stage
+        # CPU di resize e il relativo round-trip; il costo si sposta su un H2D
+        # piu' pesante (frame full-res invece di 448x448), ma niente piu' resize
+        # single-thread sulla CPU del Jetson.
         cuda_code = """
-        __global__ void preprocess_kernel(const unsigned char *bgr_in, float *rgb_out, int H, int W) {
+        __global__ void resize_preprocess_kernel(
+            const unsigned char *bgr_in, float *rgb_out,
+            int H_in, int W_in, int H_out, int W_out)
+        {
             int idx = blockIdx.x * blockDim.x + threadIdx.x;
-            int total_elements = H * W * 3;
-            
-            if (idx < total_elements) {
-                int pixel_idx = idx / 3;
-                int c = idx % 3;
-                int row = pixel_idx / W;
-                int col = pixel_idx % W;
-                int target_c = 2 - c; 
-                int dst_idx = target_c * (H * W) + row * W + col;
-                rgb_out[dst_idx] = (float)bgr_in[idx] / 255.0f;
+            int total = H_out * W_out;
+            if (idx >= total) return;
+
+            int row = idx / W_out;
+            int col = idx % W_out;
+
+            float scale_y = (float)H_in / H_out;
+            float scale_x = (float)W_in / W_out;
+            float sy = (row + 0.5f) * scale_y - 0.5f;
+            float sx = (col + 0.5f) * scale_x - 0.5f;
+
+            int y0 = (int)floorf(sy);
+            int x0 = (int)floorf(sx);
+            if (y0 < 0) y0 = 0;
+            if (y0 > H_in - 1) y0 = H_in - 1;
+            if (x0 < 0) x0 = 0;
+            if (x0 > W_in - 1) x0 = W_in - 1;
+            int y1 = y0 + 1; if (y1 > H_in - 1) y1 = H_in - 1;
+            int x1 = x0 + 1; if (x1 > W_in - 1) x1 = W_in - 1;
+
+            float wy = sy - y0; if (wy < 0.0f) wy = 0.0f; if (wy > 1.0f) wy = 1.0f;
+            float wx = sx - x0; if (wx < 0.0f) wx = 0.0f; if (wx > 1.0f) wx = 1.0f;
+
+            #pragma unroll
+            for (int c = 0; c < 3; c++) {
+                float v00 = bgr_in[(y0 * W_in + x0) * 3 + c];
+                float v01 = bgr_in[(y0 * W_in + x1) * 3 + c];
+                float v10 = bgr_in[(y1 * W_in + x0) * 3 + c];
+                float v11 = bgr_in[(y1 * W_in + x1) * 3 + c];
+
+                float top = v00 + wx * (v01 - v00);
+                float bot = v10 + wx * (v11 - v10);
+                float val = (top + wy * (bot - top)) / 255.0f;
+
+                int target_c = 2 - c; // BGR -> RGB planar
+                rgb_out[target_c * (H_out * W_out) + row * W_out + col] = val;
             }
         }
         """
         self.mod = SourceModule(cuda_code)
-        self.gpu_preprocess_kernel = self.mod.get_function("preprocess_kernel")
+        self.gpu_preprocess_kernel = self.mod.get_function("resize_preprocess_kernel")
 
         try:
             package_share_dir = get_package_share_directory('cv_package')
@@ -206,9 +242,12 @@ class LaneDetector(Node):
                     'device': device_mem,
                     'shape': shape
                 })
-                
-        self.raw_input_size = 448 * 448 * 3
-        self.device_raw_input = cuda.mem_alloc(self.raw_input_size)
+
+        # --- RAW INPUT BUFFER: ora allocato dinamicamente in base alla
+        # risoluzione camera effettiva (H_in x W_in), non piu' fisso a 448x448.
+        # Allocazione lazy alla prima callback, quando conosciamo (h, w).
+        self.device_raw_input = None
+        self.raw_input_shape = None  # (H, W) del frame camera corrente
 
     def _publish_worker(self):
         """Thread separato: encode JPEG + publish, disaccoppiato dal callback GPU."""
@@ -249,27 +288,35 @@ class LaneDetector(Node):
             self.get_logger().error(f"Failed to convert image: {str(e)}")
             return
         t_cv_bridge = time.perf_counter()
-        
-        # --- 2. PREPROCESSING (CPU Phase: Only Resize) ---
-        h, w, _ = cv_image.shape
-        resized_img = cv2.resize(cv_image, (448, 448), interpolation=cv2.INTER_LINEAR)
-        t_preproc_cpu = time.perf_counter()
 
-        # --- 3. GPU HOST TO DEVICE TRANSFER (Raw uint8) ---
+        h, w, _ = cv_image.shape
+
         try:
-            cuda.memcpy_htod_async(self.device_raw_input, resized_img.tobytes(), self.stream)
+            # --- 2/3. GPU HOST TO DEVICE TRANSFER (Raw uint8, full-res, no CPU resize) ---
+            if self.raw_input_shape != (h, w):
+                if self.device_raw_input is not None:
+                    self.device_raw_input.free()
+                self.device_raw_input = cuda.mem_alloc(h * w * 3)
+                self.raw_input_shape = (h, w)
+                self.get_logger().info(f"Allocated raw GPU input buffer for frame size {w}x{h}")
+
+            cuda.memcpy_htod_async(self.device_raw_input, cv_image.tobytes(), self.stream)
             self.stream.synchronize()
             t_h2d_raw = time.perf_counter()
-            
-            # --- 3b. GPU PREPROCESSING KERNEL ---
+
+            # --- 3b. FUSED GPU RESIZE + PREPROCESSING KERNEL ---
+            out_h, out_w = 448, 448
+            out_total = out_h * out_w
             block_size = 256
-            grid_size = int((self.raw_input_size + block_size - 1) / block_size)
-            
+            grid_size = int((out_total + block_size - 1) / block_size)
+
             self.gpu_preprocess_kernel(
-                self.device_raw_input, 
-                self.device_input, 
-                np.int32(448), 
-                np.int32(448),
+                self.device_raw_input,
+                self.device_input,
+                np.int32(h),
+                np.int32(w),
+                np.int32(out_h),
+                np.int32(out_w),
                 block=(block_size, 1, 1),
                 grid=(grid_size, 1),
                 stream=self.stream
@@ -389,6 +436,8 @@ class LaneDetector(Node):
                         filtered_class_ids, 
                         x1, y1, x2, y2
                     )
+
+                    mask_overlay = np.ascontiguousarray(mask_overlay)
                     
                     t_canvas = time.perf_counter()
                     dt_matmul = 0.0 
@@ -407,10 +456,35 @@ class LaneDetector(Node):
         ], dtype=np.uint8)
         
         # Convert index map to BGR low-res image
-        color_mask_low = color_lut[mask_overlay]
-        
-        # Scale up back to matching original camera resolution (w, h)
-        color_mask_high = cv2.resize(color_mask_low, (w, h), interpolation=cv2.INTER_NEAREST)
+        H, W = cv_image.shape[:2]
+        color_mask_high = np.zeros((H, W, 3), dtype=np.uint8)
+
+        scale_x = W / 112.0
+        scale_y = H / 112.0
+
+        ys, xs = np.where(mask_overlay != 4)
+
+        cls = mask_overlay[ys, xs]
+
+        # ⚠️ LUT corretta (identica alla tua originale)
+        colors = color_lut[cls]
+
+        x_full = (xs * scale_x).astype(np.int32)
+        y_full = (ys * scale_y).astype(np.int32)
+
+        valid = (
+            (x_full >= 0) & (x_full < W) &
+            (y_full >= 0) & (y_full < H)
+        )
+
+        x_full = x_full[valid]
+        y_full = y_full[valid]
+        colors = colors[valid]
+
+        color_mask_high[y_full, x_full] = colors
+
+        kernel = np.ones((3,3), np.uint8)
+        color_mask_high = cv2.dilate(color_mask_high, kernel, iterations=1)
         
         t_upsample_end = time.perf_counter()
         dt_upsample = (t_upsample_end - t_upsample_start) * 1000
@@ -436,17 +510,15 @@ class LaneDetector(Node):
 
         # --- METRICS CALCULATIONS ---
         dt_cv_bridge      = (t_cv_bridge - t_start) * 1000
-        dt_preproc_cpu    = (t_preproc_cpu - t_cv_bridge) * 1000
-        dt_h2d_raw        = (t_h2d_raw - t_preproc_cpu) * 1000
+        dt_h2d_raw        = (t_h2d_raw - t_cv_bridge) * 1000
         dt_preproc_gpu    = (t_preproc_gpu - t_h2d_raw) * 1000
         dt_inference      = (t_infer - t_preproc_gpu) * 1000
         dt_d2h            = (t_d2h - t_infer) * 1000
         dt_total_pipe     = (t_end - t_start) * 1000
 
         self.telemetry_stats['1_cv_bridge'].append(dt_cv_bridge)
-        self.telemetry_stats['2_preprocessing_cpu'].append(dt_preproc_cpu)
         self.telemetry_stats['3_gpu_h2d_raw'].append(dt_h2d_raw)
-        self.telemetry_stats['3b_gpu_preprocessing'].append(dt_preproc_gpu)
+        self.telemetry_stats['3b_gpu_resize_preprocess'].append(dt_preproc_gpu)
         self.telemetry_stats['4_gpu_inference'].append(dt_inference)
         self.telemetry_stats['5_gpu_d2h'].append(dt_d2h)
         self.telemetry_stats['6_post_filter'].append(dt_filter)
@@ -466,11 +538,10 @@ class LaneDetector(Node):
 
         self.get_logger().info(
             f"\n"
-            f"====== ULTRA-GRANULAR BREAKDOWN REPORT (COMPRESSED HIGH-RES) ======\n"
-            f"  1. CvBridge Image Convert:  {dt_cv_bridge:.2f} ms  (Avg: {np.mean(self.telemetry_stats['1_cv_bridge']):.2f} ms)\n"
-            f"  2. Preprocessing CPU (Resize): {dt_preproc_cpu:.2f} ms  (Avg: {np.mean(self.telemetry_stats['2_preprocessing_cpu']):.2f} ms)\n"
-            f"  3. Cuda H2D Copy (Raw uint8): {dt_h2d_raw:.2f} ms  (Avg: {np.mean(self.telemetry_stats['3_gpu_h2d_raw']):.2f} ms)\n"
-            f"  3b. CUDA Preprocess Kernel:   {dt_preproc_gpu:.2f} ms  (Avg: {np.mean(self.telemetry_stats['3b_gpu_preprocessing']):.2f} ms)\n"
+            f"====== ULTRA-GRANULAR BREAKDOWN REPORT (COMPRESSED HIGH-RES, GPU RESIZE) ======\n"
+            f"  1. CvBridge Image Convert:   {dt_cv_bridge:.2f} ms  (Avg: {np.mean(self.telemetry_stats['1_cv_bridge']):.2f} ms)\n"
+            f"  3. Cuda H2D Copy (Raw full-res): {dt_h2d_raw:.2f} ms  (Avg: {np.mean(self.telemetry_stats['3_gpu_h2d_raw']):.2f} ms)\n"
+            f"  3b. GPU Resize+Preprocess Kernel: {dt_preproc_gpu:.2f} ms  (Avg: {np.mean(self.telemetry_stats['3b_gpu_resize_preprocess']):.2f} ms)\n"
             f"  4. TRT GPU Core Inference:   {dt_inference:.2f} ms  (Avg: {np.mean(self.telemetry_stats['4_gpu_inference']):.2f} ms)\n"
             f"  5. Cuda D2H Copy:            {dt_d2h:.2f} ms  (Avg: {np.mean(self.telemetry_stats['5_gpu_d2h']):.2f} ms)\n"
             f"  [Post-Processing Sub-steps]:\n"
