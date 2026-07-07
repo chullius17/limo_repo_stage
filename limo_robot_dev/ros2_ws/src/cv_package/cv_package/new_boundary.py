@@ -33,18 +33,11 @@ class CurbDetector(Node):
         # Publishers for native 112p output streams
         self.debug_pub = self.create_publisher(CompressedImage, '/detection/curb_points_debug/compressed', 10)
         self.lines_pub = self.create_publisher(Image, '/detection/lines_and_curbs/raw', 10)
-        
-        # Tailored morphological kernels for native 112p resolution
-        self.kernel_bg_clean = np.ones((3, 3), dtype=np.uint8)
-        self.kernel_skel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-        
-        # Keep every pixel at 112p resolution
-        self.sampling_step = 1
 
         # Spin up the dedicated worker thread to handle the math pipeline
         self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker_thread.start()
-        self.get_logger().info("CurbDetector background-only worker thread initialized at native 112p.")
+        self.get_logger().info("CurbDetector ultra-streamlined worker thread initialized at native 112p.")
 
     def image_callback(self, msg):
         """
@@ -79,8 +72,8 @@ class CurbDetector(Node):
         """Sequential native resolution processing and rendering engine."""
         # Initialize dictionary with default zeros to prevent any future KeyError on early return
         t = {
-            'decomp': 0.0, 'step1_masks': 0.0, 'step2_bg_clean': 0.0, 
-            'step3_skeleton': 0.0, 'step4_5_drawing': 0.0, 'step6_publish': 0.0
+            'decomp': 0.0, 'step1_masks': 0.0, 'step2_crop': 0.0, 
+            'step3_color_iso': 0.0, 'step4_drawing': 0.0, 'step5_publish': 0.0
         }
         start_total = time.perf_counter()
         
@@ -118,17 +111,14 @@ class CurbDetector(Node):
                 self.publish_raw_image(self.lines_pub, empty_frame, msg.header.stamp)
             return   
 
-        # --- STEP 2: GEOMETRIC CROP & BACKGROUND CLEANING ---
+        # --- STEP 2: GEOMETRIC CROP (NO MORPHOLOGY) ---
         t_start = time.perf_counter()
-        # Apply region-of-interest vertical cropping
+        # Apply region-of-interest vertical cropping directly to raw mask
         background_mask[int(native_h * 0.91):, :] = False
         background_mask[:int(native_h * 0.54), :] = False
-
-        # Morphological opening to eliminate small speckles and crumb noise
-        background_mask = cv2.morphologyEx(background_mask, cv2.MORPH_OPEN, self.kernel_bg_clean, iterations=1)
-        t['step2_bg_clean'] = (time.perf_counter() - t_start) * 1000
+        t['step2_crop'] = (time.perf_counter() - t_start) * 1000
         
-        # --- STEP 3: COLOR ISOLATION & SKELETONIZATION ---
+        # --- STEP 3: DIRECT COLOR ISOLATION (RAW MASKS) ---
         t_start = time.perf_counter()
         b_low = native_img[:, :, 0]
         g_low = native_img[:, :, 1]
@@ -137,57 +127,36 @@ class CurbDetector(Node):
         # Robust color thresholding to handle potential JPEG compression noise
         is_red_low = (r_low > 50) & (r_low > g_low.astype(np.int16) + 20) & (r_low > b_low.astype(np.int16) + 20)
         is_green_low = (g_low > 50) & (g_low > r_low.astype(np.int16) + 20) & (g_low > b_low.astype(np.int16) + 20)
+        t['step3_color_iso'] = (time.perf_counter() - t_start) * 1000
 
-        mask_red = is_red_low.astype(np.uint8) * 255
-
-        # Standard topological skeletonization loop using dilation to match continuous lines
-        skel_red = np.zeros_like(mask_red)
-        done = False
-        while not done and np.any(mask_red):
-            eroded = cv2.erode(mask_red, self.kernel_skel)
-            temp = cv2.dilate(eroded, self.kernel_skel)
-            temp = cv2.subtract(mask_red, temp)
-            skel_red = cv2.bitwise_or(skel_red, temp)
-            mask_red = eroded.copy()
-            if cv2.countNonZero(mask_red) == 0:
-                done = True
-
-        # Extract coordinates of unclassified background pixels
-        raw_points_background = np.argwhere(background_mask > 0)[::self.sampling_step]
-        t['step3_skeleton'] = (time.perf_counter() - t_start) * 1000
-
-        # --- STEP 4 & 5: NATIVE-RESOLUTION RENDERING ---
+        # --- STEP 4: NATIVE-RESOLUTION RENDERING via DIRECT MASK INDEXING ---
         t_start = time.perf_counter()
         
-        # Render the standard analytical lines directly onto a 112p canvas
+        # Render the standard analytical lines directly onto a 112p canvas using fast logical indexing
         if has_lines_sub:
             only_lines_frame = np.zeros((native_h, native_w, 3), dtype=np.uint8)
-            only_lines_frame[skel_red > 0] = [0, 0, 255]
+            only_lines_frame[is_red_low] = [0, 0, 255]
             only_lines_frame[is_green_low] = [0, 255, 0]
-            
-            if len(raw_points_background) > 0:
-                only_lines_frame[raw_points_background[:, 0], raw_points_background[:, 1]] = [255, 0, 255]
+            only_lines_frame[background_mask > 0] = [255, 0, 255]
         else:
             only_lines_frame = None
 
-        # Render the debug overlay stream directly onto the native 112p canvas (Dilation removed here)
+        # Render the debug overlay stream directly onto the native 112p canvas without any filters
         if has_debug_sub:
             full_overlay_frame = native_img.copy()
-            if len(raw_points_background) > 0:
-                # Draw native 1x1 background points without any prior spatial dilation
-                full_overlay_frame[raw_points_background[:, 0], raw_points_background[:, 1]] = [255, 0, 255]
+            full_overlay_frame[background_mask > 0] = [255, 0, 255]
         else:
             full_overlay_frame = None
             
-        t['step4_5_drawing'] = (time.perf_counter() - t_start) * 1000
+        t['step4_drawing'] = (time.perf_counter() - t_start) * 1000
 
-        # --- STEP 6: MULTI-THREADED ROS 2 PUBLISH ---
+        # --- STEP 5: MULTI-THREADED ROS 2 PUBLISH ---
         t_start = time.perf_counter()
         if has_debug_sub and full_overlay_frame is not None:
             self.publish_compressed_image(self.debug_pub, full_overlay_frame, msg.header.stamp)
         if has_lines_sub and only_lines_frame is not None:
             self.publish_raw_image(self.lines_pub, only_lines_frame, msg.header.stamp)
-        t['step6_publish'] = (time.perf_counter() - t_start) * 1000
+        t['step5_publish'] = (time.perf_counter() - t_start) * 1000
         
         t['total'] = (time.perf_counter() - start_total) * 1000
         self.log_diagnostics(native_w, native_h, t)
@@ -225,15 +194,15 @@ class CurbDetector(Node):
         
         self.get_logger().info(
             f"\n"
-            f"================ NATIVE 112p BACKGROUND WORKER PROFILE ({w}x{h} @ {fps:.1f} REAL FPS) ================\n"
+            f"================ NATIVE 112p ULTRA-STREAMLINED PROFILE ({w}x{h} @ {fps:.1f} REAL FPS) ================\n"
             f"  [Total Worker Callback Latency]  {t['total']:.2f} ms\n"
             f"  -----------------------------------------------------------------\n"
             f"  [Decompression]                  {t['decomp']:.2f} ms\n"
             f"  [Step 1: Mask Extraction]        {t['step1_masks']:.2f} ms\n"
-            f"  [Step 2: Crop & BG Clean]        {t['step2_bg_clean']:.2f} ms\n"
-            f"  [Step 3: Skeleton & Points]      {t['step3_skeleton']:.2f} ms\n"
-            f"  [Step 4-5: Native-Res Draw]      {t['step4_5_drawing']:.2f} ms\n"
-            f"  [Step 6: ROS 2 Publish]          {t['step6_publish']:.2f} ms\n"
+            f"  [Step 2: Geometric Crop]         {t['step2_crop']:.2f} ms\n"
+            f"  [Step 3: Color Isolation]        {t['step3_color_iso']:.2f} ms\n"
+            f"  [Step 4: Native-Res Draw]        {t['step4_drawing']:.2f} ms\n"
+            f"  [Step 5: ROS 2 Publish]          {t['step5_publish']:.2f} ms\n"
             f"========================================================================="
         )
 

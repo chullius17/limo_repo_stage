@@ -1,80 +1,22 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image, CompressedImage # CHANGE: Added CompressedImage for efficient transport
+from sensor_msgs.msg import Image, CompressedImage
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
 import os
 import tensorrt as trt
 import pycuda.driver as cuda
-import pycuda.autoinit
-from pycuda.compiler import SourceModule 
+import pycuda.autoinit  # This initializes the CUDA context on the main thread
+from pycuda.compiler import SourceModule
 from ament_index_python.packages import get_package_share_directory
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 import time
 from collections import deque
-import numba as nb
 import threading
 import queue
-
-# --- OPTIMIZATION #2: FUSED MASK COMPUTATION VIA NUMBA, PARALLELIZED OVER BOXES ---
-# Rispetto alla versione originale:
-#  - parallel=True + nb.prange sulle box: sfrutta i 4 core Cortex-A57 del Nano
-#    invece di girare single-thread.
-#  - il loop k interno (32 coeff) e' sostituito da un dot vettorizzato riga per riga
-#    (masks_coeffs[i] @ proto[:, y, xa:xb+1]), che numba compila come SIMD invece
-#    del loop scalare k=0..31 originale.
-@nb.njit(fastmath=True, parallel=True)
-def numba_fused_mask_processing(masks_coeffs, proto, class_ids, x1, y1, x2, y2):
-    num_boxes = masks_coeffs.shape[0]
-
-    # Un canvas per-box (poi ridotto) evita race condition tra thread paralleli
-    # che scriverebbero sullo stesso canvas condiviso.
-    canvases = np.full((num_boxes, 4, 112, 112), -10.0, dtype=np.float32)
-
-    for i in nb.prange(num_boxes):
-        c_id = class_ids[i]
-        if c_id < 0 or c_id > 3:
-            continue
-
-        xa, ya, xb, yb = x1[i], y1[i], x2[i], y2[i]
-        coeffs_i = masks_coeffs[i]
-
-        for y in range(ya, yb + 1):
-            # dot vettorizzato sulla riga invece del loop k manuale
-            row_vals = np.zeros(xb - xa + 1, dtype=np.float32)
-            for k in range(32):
-                ck = coeffs_i[k]
-                proto_row = proto[k, y, xa:xb + 1]
-                for xi in range(row_vals.shape[0]):
-                    row_vals[xi] += ck * proto_row[xi]
-
-            for xi in range(row_vals.shape[0]):
-                x = xa + xi
-                if row_vals[xi] > canvases[i, c_id, y, x]:
-                    canvases[i, c_id, y, x] = row_vals[xi]
-
-    # Riduzione sequenziale (poco costosa) delle canvas per-box in un unico overlay
-    low_res_overlay = np.full((112, 112), 4, dtype=np.uint8)
-    priorities = [3, 0, 2, 1]
-
-    best_val = np.full((4, 112, 112), -10.0, dtype=np.float32)
-    for i in range(num_boxes):
-        for c in range(4):
-            for y in range(112):
-                for x in range(112):
-                    v = canvases[i, c, y, x]
-                    if v > best_val[c, y, x]:
-                        best_val[c, y, x] = v
-
-    for p in priorities:
-        for y in range(112):
-            for x in range(112):
-                if best_val[p, y, x] > 0.0:
-                    low_res_overlay[y, x] = p
-
-    return low_res_overlay
+from turbojpeg import TurboJPEG, TJPF_BGR  # Changed to TJPF_BGR to fix color channel swapping
 
 
 class LaneDetector(Node):
@@ -82,15 +24,13 @@ class LaneDetector(Node):
     def __init__(self):
         super().__init__('lane_detector')
 
-        # CHANGE: Type updated to CompressedImage and topic adjusted to show compression type
+        # Capture the active CUDA context from the main thread
+        self.cuda_context = cuda.Context.get_current()
+
         self.mask_pub = self.create_publisher(CompressedImage, '/detection/lane_masks/compressed', 10)
         self.bridge = CvBridge()
-        
-        # --- OPTIMIZATION #4: QoS "solo ultimo frame" (anti-lag) ---
-        # depth=1 + KEEP_LAST + BEST_EFFORT: se il callback e' piu' lento del
-        # publisher della camera, DDS scarta i frame vecchi in coda invece di
-        # accumularli. Il nodo elabora sempre il frame piu' recente disponibile,
-        # mai un backlog: si perdono frame, ma non si accumula latenza.
+        self.jpeg_encoder = TurboJPEG()
+
         latest_frame_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
@@ -98,50 +38,33 @@ class LaneDetector(Node):
         )
 
         self.rgb_sub = self.create_subscription(
-            Image, 
-            '/camera/color/image_raw', 
-            self.image_callback, 
+            Image,
+            '/camera/color/image_raw',
+            self.image_callback,
             latest_frame_qos
         )
 
-        # --- ULTRA-GRANULAR TELEMETRY STORAGE ---
         self.window_size = 100
         self.telemetry_stats = {
             '1_cv_bridge': deque(maxlen=self.window_size),
-            '3_gpu_h2d_raw': deque(maxlen=self.window_size),
-            '3b_gpu_resize_preprocess': deque(maxlen=self.window_size),
             '4_gpu_inference': deque(maxlen=self.window_size),
-            '5_gpu_d2h': deque(maxlen=self.window_size),
             '6_post_filter': deque(maxlen=self.window_size),
             '7_post_nms': deque(maxlen=self.window_size),
-            '8_post_matmul': deque(maxlen=self.window_size),
             '9_post_canvas': deque(maxlen=self.window_size),
-            '10_post_upsample': deque(maxlen=self.window_size),
             '11_ros_publish_enqueue': deque(maxlen=self.window_size),
             'total_pipeline': deque(maxlen=self.window_size),
             'async_encode_publish': deque(maxlen=self.window_size),
         }
 
-        # --- OPTIMIZATION #1: ASYNC ENCODE+PUBLISH WORKER ---
-        # JPEG encode a piena risoluzione e' CPU-bound e non richiede la GPU.
-        # Disaccoppiandolo dal thread di callback il collo di bottiglia della
-        # pipeline diventa il singolo stage piu' lento (inferenza, ~35ms) invece
-        # della somma di tutti gli stage (~104ms). maxsize=1 con drop-latest
-        # garantisce che pubblichiamo sempre il frame piu' recente disponibile,
-        # sacrificando frame vecchi piuttosto che accumulare latenza.
+        self.inference_queue = queue.Queue(maxsize=1)
         self.pub_queue = queue.Queue(maxsize=1)
+
+        self.inference_thread = threading.Thread(target=self._inference_worker, daemon=True)
         self.pub_thread = threading.Thread(target=self._publish_worker, daemon=True)
+        self.inference_thread.start()
         self.pub_thread.start()
 
-        # --- OPTIMIZATION #5: FUSED GPU RESIZE + BGR2RGB + NORMALIZE KERNEL ---
-        # Prima: cv2.resize su CPU (single-thread, spesso 3-8ms su Cortex-A57)
-        # seguito da upload di un buffer gia' 448x448 e da un kernel separato
-        # di solo preprocessing. Ora: upload del frame RAW a risoluzione camera
-        # (H_in x W_in) e resize bilineare + BGR->RGB planar + normalizzazione
-        # fusi in un unico kernel eseguito interamente su GPU. Elimina lo stage
-        # CPU di resize e il relativo round-trip; il costo si sposta su un H2D
-        # piu' pesante (frame full-res invece di 448x448), ma niente piu' resize
-        # single-thread sulla CPU del Jetson.
+        # Unified CUDA Source Module featuring Preprocessing and Mask Decoding
         cuda_code = """
         __global__ void resize_preprocess_kernel(
             const unsigned char *bgr_in, float *rgb_out,
@@ -182,13 +105,62 @@ class LaneDetector(Node):
                 float bot = v10 + wx * (v11 - v10);
                 float val = (top + wy * (bot - top)) / 255.0f;
 
-                int target_c = 2 - c; // BGR -> RGB planar
+                int target_c = 2 - c;
                 rgb_out[target_c * (H_out * W_out) + row * W_out + col] = val;
             }
+        }
+
+        __global__ void decode_masks_gpu_kernel(
+            const float *proto,          // (32, 112, 112) -> CHW format
+            const float *coeffs,         // (num_boxes, 32)
+            const int *class_ids,        // (num_boxes)
+            const int *x1, const int *y1, const int *x2, const int *y2,
+            int num_boxes,
+            unsigned char *mask_out)     // (112, 112) output buffer
+        {
+            int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            int total_pixels = 112 * 112;
+            if (idx >= total_pixels) return;
+
+            int row = idx / 112;
+            int col = idx % 112;
+
+            // Tracks the highest score for each class locally
+            float best_val[4] = {-10.0f, -10.0f, -10.0f, -10.0f};
+
+            for (int i = 0; i < num_boxes; i++) {
+                int c = class_ids[i];
+                if (c < 0 || c > 3) continue;
+
+                // Geometric boundary check replacing python slices
+                if (row >= y1[i] && row <= y2[i] && col >= x1[i] && col <= x2[i]) {
+                    float sum = 0.0f;
+                    #pragma unroll
+                    for (int ch = 0; ch < 32; ch++) {
+                        sum += coeffs[i * 32 + ch] * proto[ch * total_pixels + idx];
+                    }
+                    if (sum > best_val[c]) {
+                        best_val[c] = sum;
+                    }
+                }
+            }
+
+            // Apply priority sorting (3, 0, 2, 1) to settle conflicts on-chip
+            unsigned char final_class = 4;
+            int priorities[4] = {3, 0, 2, 1};
+            for (int k = 0; k < 4; k++) {
+                int p = priorities[k];
+                if (best_val[p] > 0.0f) {
+                    final_class = p;
+                }
+            }
+
+            mask_out[idx] = final_class;
         }
         """
         self.mod = SourceModule(cuda_code)
         self.gpu_preprocess_kernel = self.mod.get_function("resize_preprocess_kernel")
+        self.gpu_decode_kernel = self.mod.get_function("decode_masks_gpu_kernel")
 
         try:
             package_share_dir = get_package_share_directory('cv_package')
@@ -200,39 +172,37 @@ class LaneDetector(Node):
         self.model_path = self.get_parameter('model_path').value
 
         self.get_logger().info(f'Initializing TensorRT Segmentation with model: {self.model_path}')
-        
+
         try:
             self.trt_logger = trt.Logger(trt.Logger.WARNING)
             with open(self.model_path, 'rb') as f:
                 self.runtime = trt.Runtime(self.trt_logger)
                 self.engine = self.runtime.deserialize_cuda_engine(f.read())
-            
+
             self.trt_context = self.engine.create_execution_context()
             self.stream = cuda.Stream()
-            
+
             self.allocate_buffers()
             self.get_logger().info("TensorRT engine and GPU contexts successfully created!")
         except Exception as e:
             self.get_logger().error(f"CRITICAL: Failed to load TensorRT Engine: {str(e)}")
             self.engine = None
             return
-        
-        self.get_logger().info("GPU Accelerated 4-Class Segmenter Node started!")
 
     def allocate_buffers(self):
         self.bindings = []
         self.output_info = []
-        
+
         for binding in self.engine:
             shape = self.engine.get_binding_shape(binding)
             size = trt.volume(shape)
             dtype = trt.nptype(self.engine.get_binding_dtype(binding))
-            
+
             host_mem = cuda.pagelocked_empty(size, dtype)
             device_mem = cuda.mem_alloc(host_mem.nbytes)
-            
+
             self.bindings.append(int(device_mem))
-            
+
             if self.engine.binding_is_input(binding):
                 self.host_input = host_mem
                 self.device_input = device_mem
@@ -240,71 +210,78 @@ class LaneDetector(Node):
                 self.output_info.append({
                     'host': host_mem,
                     'device': device_mem,
-                    'shape': shape
+                    'shape': shape,
+                    'is_proto': (len(shape) == 4 or 112 in shape)
                 })
 
-        # --- RAW INPUT BUFFER: ora allocato dinamicamente in base alla
-        # risoluzione camera effettiva (H_in x W_in), non piu' fisso a 448x448.
-        # Allocazione lazy alla prima callback, quando conosciamo (h, w).
         self.device_raw_input = None
-        self.raw_input_shape = None  # (H, W) del frame camera corrente
+        self.raw_input_shape = None
+        self.host_raw_pinned = None
 
-    def _publish_worker(self):
-        """Thread separato: encode JPEG + publish, disaccoppiato dal callback GPU."""
-        while rclpy.ok():
-            item = self.pub_queue.get()
-            if item is None:
-                continue
-            color_mask_high, stamp = item
-
-            t0 = time.perf_counter()
-            try:
-                success, encoded_img = cv2.imencode(
-                    '.jpg', color_mask_high, [cv2.IMWRITE_JPEG_QUALITY, 80]
-                )
-                if success:
-                    ros_mask_msg = CompressedImage()
-                    ros_mask_msg.header.stamp = stamp
-                    ros_mask_msg.format = "jpeg"
-                    ros_mask_msg.data = encoded_img.tobytes()
-                    self.mask_pub.publish(ros_mask_msg)
-                else:
-                    self.get_logger().error("Failed to encode BGR mask to JPEG format")
-            except Exception as e:
-                self.get_logger().error(f"Failed to publish compressed output image: {str(e)}")
-            t1 = time.perf_counter()
-            self.telemetry_stats['async_encode_publish'].append((t1 - t0) * 1000)
+        # Pre-allocate static GPU execution contexts for variables after NMS
+        self.MAX_BOXES = 64
+        self.gpu_coeffs = cuda.mem_alloc(self.MAX_BOXES * 32 * 4)
+        self.gpu_class_ids = cuda.mem_alloc(self.MAX_BOXES * 4)
+        self.gpu_x1 = cuda.mem_alloc(self.MAX_BOXES * 4)
+        self.gpu_y1 = cuda.mem_alloc(self.MAX_BOXES * 4)
+        self.gpu_x2 = cuda.mem_alloc(self.MAX_BOXES * 4)
+        self.gpu_y2 = cuda.mem_alloc(self.MAX_BOXES * 4)
+        
+        # Pinned 12KB host container for fast asynchronous PCIe download
+        self.gpu_mask_out = cuda.mem_alloc(112 * 112)
+        self.host_mask_out = cuda.pagelocked_empty((112, 112), dtype=np.uint8)
 
     def image_callback(self, msg):
-        if self.engine is None:
-            return
-        
-        t_start = time.perf_counter()
-
-        # --- 1. CV_BRIDGE CONVERSION ---
+        t_cv_bridge_start = time.perf_counter()
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as e:
             self.get_logger().error(f"Failed to convert image: {str(e)}")
             return
-        t_cv_bridge = time.perf_counter()
+            
+        cv_time = (time.perf_counter() - t_cv_bridge_start) * 1000
+        self.telemetry_stats['1_cv_bridge'].append(cv_time)
 
+        if self.inference_queue.full():
+            try:
+                self.inference_queue.get_nowait()
+            except queue.Empty:
+                pass
+        
+        try:
+            self.inference_queue.put_nowait((cv_image, msg.header.stamp))
+        except queue.Full:
+            pass
+
+    def _inference_worker(self):
+        self.cuda_context.push()
+
+        while rclpy.ok():
+            try:
+                item = self.inference_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            cv_image, stamp = item
+            self._process_frame(cv_image, stamp)
+
+        self.cuda_context.pop()
+
+    def _process_frame(self, cv_image, stamp):
+        t_start = time.perf_counter()
         h, w, _ = cv_image.shape
 
         try:
-            # --- 2/3. GPU HOST TO DEVICE TRANSFER (Raw uint8, full-res, no CPU resize) ---
             if self.raw_input_shape != (h, w):
                 if self.device_raw_input is not None:
                     self.device_raw_input.free()
                 self.device_raw_input = cuda.mem_alloc(h * w * 3)
                 self.raw_input_shape = (h, w)
-                self.get_logger().info(f"Allocated raw GPU input buffer for frame size {w}x{h}")
+                self.host_raw_pinned = cuda.pagelocked_empty((h, w, 3), dtype=np.uint8)
 
-            cuda.memcpy_htod_async(self.device_raw_input, cv_image.tobytes(), self.stream)
-            self.stream.synchronize()
-            t_h2d_raw = time.perf_counter()
+            np.copyto(self.host_raw_pinned, cv_image)
+            cuda.memcpy_htod_async(self.device_raw_input, self.host_raw_pinned, self.stream)
 
-            # --- 3b. FUSED GPU RESIZE + PREPROCESSING KERNEL ---
             out_h, out_w = 448, 448
             out_total = out_h * out_w
             block_size = 256
@@ -321,240 +298,195 @@ class LaneDetector(Node):
                 grid=(grid_size, 1),
                 stream=self.stream
             )
-            self.stream.synchronize()
-            t_preproc_gpu = time.perf_counter()
-            
-            # --- 4. TENSORRT INFERENCE ---
+
             self.trt_context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
-            self.stream.synchronize()
-            t_infer = time.perf_counter()
-            
-            # --- 5. GPU DEVICE TO HOST TRANSFER ---
+
+            # CRITICAL OPTIMIZATION: Extract structural layouts and leave Proto inside the GPU VRAM
+            proto_info = None
+            pred_info = None
             for out in self.output_info:
-                cuda.memcpy_dtoh_async(out['host'], out['device'], self.stream)
+                if out['is_proto']:
+                    proto_info = out
+                else:
+                    pred_info = out
+                    # Download only the bounding boxes predictions to Host
+                    cuda.memcpy_dtoh_async(out['host'], out['device'], self.stream)
+
             self.stream.synchronize()
-            t_d2h = time.perf_counter()
-            
-            out1 = self.output_info[0]['host'].reshape(self.output_info[0]['shape'])
-            out2 = self.output_info[1]['host'].reshape(self.output_info[1]['shape'])
-            
-            if len(self.output_info[0]['shape']) == 4:
-                proto = np.squeeze(out1)
-                predictions = np.squeeze(out2)
-            else:
-                predictions = np.squeeze(out1)
-                proto = np.squeeze(out2)
+            t_gpu_done = time.perf_counter()
+
+            predictions = np.squeeze(pred_info['host'].reshape(pred_info['shape']))
 
         except Exception as e:
-            self.get_logger().error(f"GPU Preproc/Inference Step failed: {str(e)}")
+            self.get_logger().error(f"GPU Pipeline failed: {str(e)}")
             return
-        
-        dt_filter = dt_nms = dt_matmul = dt_canvas = dt_upsample = 0.0
+
+        dt_filter = dt_nms = dt_canvas = 0.0
         mask_overlay = np.full((112, 112), 4, dtype=np.uint8)
 
         t_post_start = time.perf_counter()
 
         if predictions.ndim == 2:
-            # --- OPTIMIZATION #3: FILTER PRIMA DELL'ARGMAX COMPLETO ---
-            # Originale: argmax + fancy-index su TUTTE le ~8400 predizioni prima
-            # del threshold. Ora: max() su tutte le righe (piu' economico di
-            # argmax), si filtra per soglia, e l'argmax vero e proprio (piu'
-            # costoso) si calcola solo sui sopravvissuti al threshold.
-            t0 = time.perf_counter()
-
-            # NOTE: see effects on neural network
             predictions = predictions.T
-            t1 = time.perf_counter()
-
             num_classes = 4
-            scores = predictions[:, 4:4+num_classes]
-            t2 = time.perf_counter()
-
+            scores = predictions[:, 4:4 + num_classes]
             max_conf = scores.max(axis=1)
-            t3 = time.perf_counter()
-
             mask_threshold = max_conf > 0.3
-            t4 = time.perf_counter()
 
             filtered_preds = predictions[mask_threshold]
-            t5 = time.perf_counter()
-
             filtered_scores = scores[mask_threshold]
-            t6 = time.perf_counter()
-
             filtered_class_ids = np.argmax(filtered_scores, axis=1)
-            t7 = time.perf_counter()
-
             filtered_confs = max_conf[mask_threshold]
-            t8 = time.perf_counter()
             t_filter = time.perf_counter()
-
-            print("transpose :", (t1-t0)*1000)
-            print("scores    :", (t2-t1)*1000)
-            print("max       :", (t3-t2)*1000)
-            print("threshold :", (t4-t3)*1000)
-            print("pred copy :", (t5-t4)*1000)
-            print("score copy:", (t6-t5)*1000)
-            print("argmax    :", (t7-t6)*1000)
-            print("conf copy :", (t8-t7)*1000)
-
             dt_filter = (t_filter - t_post_start) * 1000
-            
+
             if len(filtered_preds) > 0:
-                # --- 7. POST-PROC: NMS BOXES ---
                 boxes = filtered_preds[:, 0:4]
                 cx, cy, bw, bh = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
                 xmin = (cx - bw / 2).astype(np.int32)
                 ymin = (cy - bh / 2).astype(np.int32)
                 bw_int = bw.astype(np.int32)
                 bh_int = bh.astype(np.int32)
-                
+
                 nms_boxes = np.stack([xmin, ymin, bw_int, bh_int], axis=1).tolist()
                 indices = cv2.dnn.NMSBoxes(nms_boxes, [float(c) for c in filtered_confs], score_threshold=0.3, nms_threshold=0.45)
                 t_nms = time.perf_counter()
                 dt_nms = (t_nms - t_filter) * 1000
-                
+
                 if len(indices) > 0:
                     indices = indices.flatten()
                     filtered_preds = filtered_preds[indices]
                     filtered_class_ids = filtered_class_ids[indices]
                     boxes = boxes[indices]
-                    
-                    # Compute specialized box bounds scaled down to the 112x112 layout
+
                     cx, cy, bw, bh = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
                     x1 = np.clip((cx - bw / 2) * (112.0 / 448.0), 0, 111).astype(np.int32)
                     y1 = np.clip((cy - bh / 2) * (112.0 / 448.0), 0, 111).astype(np.int32)
                     x2 = np.clip((cx + bw / 2) * (112.0 / 448.0), 0, 111).astype(np.int32)
                     y2 = np.clip((cy + bh / 2) * (112.0 / 448.0), 0, 111).astype(np.int32)
+
+                    masks_coeffs = filtered_preds[:, 4 + num_classes: 4 + num_classes + 32]
+
+                    # --- GPU MASK DECODING ROUTINE ---
+                    num_boxes = min(len(filtered_preds), self.MAX_BOXES)
                     
-                    # --- 8 & 9. FUSED NUMBA POST-PROCESSING (parallel over boxes) ---
-                    masks_coeffs = filtered_preds[:, 4+num_classes : 4+num_classes+32]
-                    
-                    mask_overlay = numba_fused_mask_processing(
-                        masks_coeffs, 
-                        proto, 
-                        filtered_class_ids, 
-                        x1, y1, x2, y2
+                    # Upload small post-processed configuration vectors back to GPU
+                    cuda.memcpy_htod_async(self.gpu_coeffs, masks_coeffs[:num_boxes].astype(np.float32), self.stream)
+                    cuda.memcpy_htod_async(self.gpu_class_ids, filtered_class_ids[:num_boxes].astype(np.int32), self.stream)
+                    cuda.memcpy_htod_async(self.gpu_x1, x1[:num_boxes].astype(np.int32), self.stream)
+                    cuda.memcpy_htod_async(self.gpu_y1, y1[:num_boxes].astype(np.int32), self.stream)
+                    cuda.memcpy_htod_async(self.gpu_x2, x2[:num_boxes].astype(np.int32), self.stream)
+                    cuda.memcpy_htod_async(self.gpu_y2, y2[:num_boxes].astype(np.int32), self.stream)
+
+                    # Trigger parallel decoding matrix multiplication inside GPU
+                    dec_block = 256
+                    dec_grid = int((112 * 112 + dec_block - 1) / dec_block)
+                    self.gpu_decode_kernel(
+                        proto_info['device'],
+                        self.gpu_coeffs,
+                        self.gpu_class_ids,
+                        self.gpu_x1, self.gpu_y1, self.gpu_x2, self.gpu_y2,
+                        np.int32(num_boxes),
+                        self.gpu_mask_out,
+                        block=(dec_block, 1, 1),
+                        grid=(dec_grid, 1),
+                        stream=self.stream
                     )
 
-                    mask_overlay = np.ascontiguousarray(mask_overlay)
-                    
+                    # Async download of the tiny 12KB matrix layout
+                    cuda.memcpy_dtoh_async(self.host_mask_out, self.gpu_mask_out, self.stream)
+                    self.stream.synchronize()
+                    mask_overlay = self.host_mask_out
+
                     t_canvas = time.perf_counter()
-                    dt_matmul = 0.0 
                     dt_canvas = (t_canvas - t_nms) * 1000
-        
-        # --- 10. POST-PROC: COLOR GENERATION & ORIGINAL-RESOLUTION UPSAMPLE ---
-        t_upsample_start = time.perf_counter()
-        
-        # Color map dictionary translated exactly to a fast BGR matrix lookup table
-        color_lut = np.array([
-            [0, 255, 0],    # Class 0: Dashed Lines -> Green
-            [255, 0, 0],    # Class 1: Parking Lots -> Blue
-            [0, 0, 255],    # Class 2: Solid Lines  -> Red
-            [80, 80, 80],   # Class 3: Road Surface -> Gray
-            [0, 0, 0]       # Class 4: Background   -> Black
-        ], dtype=np.uint8)
-        
-        # Convert index map to BGR low-res image
-        H, W = cv_image.shape[:2]
-        color_mask_high = np.zeros((H, W, 3), dtype=np.uint8)
 
-        scale_x = W / 112.0
-        scale_y = H / 112.0
-
-        ys, xs = np.where(mask_overlay != 4)
-
-        cls = mask_overlay[ys, xs]
-
-        # ⚠️ LUT corretta (identica alla tua originale)
-        colors = color_lut[cls]
-
-        x_full = (xs * scale_x).astype(np.int32)
-        y_full = (ys * scale_y).astype(np.int32)
-
-        valid = (
-            (x_full >= 0) & (x_full < W) &
-            (y_full >= 0) & (y_full < H)
-        )
-
-        x_full = x_full[valid]
-        y_full = y_full[valid]
-        colors = colors[valid]
-
-        color_mask_high[y_full, x_full] = colors
-
-        kernel = np.ones((3,3), np.uint8)
-        color_mask_high = cv2.dilate(color_mask_high, kernel, iterations=1)
-        
-        t_upsample_end = time.perf_counter()
-        dt_upsample = (t_upsample_end - t_upsample_start) * 1000
-
-        # --- 11. ENQUEUE FOR ASYNC ENCODE+PUBLISH (OPTIMIZATION #1) ---
-        # Non incodifichiamo/pubblichiamo piu' qui in modo sincrono: mettiamo il
-        # frame in coda (maxsize=1, drop-latest) e il thread worker si occupa di
-        # encode JPEG + publish in parallelo rispetto al prossimo ciclo GPU.
         t_pub_start = time.perf_counter()
+        
         if self.pub_queue.full():
             try:
-                self.pub_queue.get_nowait()  # scarta il frame vecchio non ancora pubblicato
+                self.pub_queue.get_nowait()
             except queue.Empty:
                 pass
         try:
-            self.pub_queue.put_nowait((color_mask_high, msg.header.stamp))
+            self.pub_queue.put_nowait((mask_overlay, stamp))
         except queue.Full:
             pass
+            
         t_pub_end = time.perf_counter()
         dt_pub = (t_pub_end - t_pub_start) * 1000
 
         t_end = time.perf_counter()
 
-        # --- METRICS CALCULATIONS ---
-        dt_cv_bridge      = (t_cv_bridge - t_start) * 1000
-        dt_h2d_raw        = (t_h2d_raw - t_cv_bridge) * 1000
-        dt_preproc_gpu    = (t_preproc_gpu - t_h2d_raw) * 1000
-        dt_inference      = (t_infer - t_preproc_gpu) * 1000
-        dt_d2h            = (t_d2h - t_infer) * 1000
-        dt_total_pipe     = (t_end - t_start) * 1000
+        dt_gpu_pipeline = (t_gpu_done - t_start) * 1000
+        dt_total_pipe = (t_end - t_start) * 1000
 
-        self.telemetry_stats['1_cv_bridge'].append(dt_cv_bridge)
-        self.telemetry_stats['3_gpu_h2d_raw'].append(dt_h2d_raw)
-        self.telemetry_stats['3b_gpu_resize_preprocess'].append(dt_preproc_gpu)
-        self.telemetry_stats['4_gpu_inference'].append(dt_inference)
-        self.telemetry_stats['5_gpu_d2h'].append(dt_d2h)
+        self.telemetry_stats['4_gpu_inference'].append(dt_gpu_pipeline)
         self.telemetry_stats['6_post_filter'].append(dt_filter)
         self.telemetry_stats['7_post_nms'].append(dt_nms)
-        self.telemetry_stats['8_post_matmul'].append(dt_matmul)
         self.telemetry_stats['9_post_canvas'].append(dt_canvas)
-        self.telemetry_stats['10_post_upsample'].append(dt_upsample)
         self.telemetry_stats['11_ros_publish_enqueue'].append(dt_pub)
         self.telemetry_stats['total_pipeline'].append(dt_total_pipe)
 
         avg_pipeline = np.mean(self.telemetry_stats['total_pipeline'])
         fps = 1000.0 / avg_pipeline if avg_pipeline > 0 else 0.0
-        avg_async_pub = (
-            np.mean(self.telemetry_stats['async_encode_publish'])
-            if len(self.telemetry_stats['async_encode_publish']) > 0 else 0.0
-        )
+        avg_async_pub = np.mean(self.telemetry_stats['async_encode_publish']) if len(self.telemetry_stats['async_encode_publish']) > 0 else 0.0
 
         self.get_logger().info(
             f"\n"
-            f"====== ULTRA-GRANULAR BREAKDOWN REPORT (COMPRESSED HIGH-RES, GPU RESIZE) ======\n"
-            f"  1. CvBridge Image Convert:   {dt_cv_bridge:.2f} ms  (Avg: {np.mean(self.telemetry_stats['1_cv_bridge']):.2f} ms)\n"
-            f"  3. Cuda H2D Copy (Raw full-res): {dt_h2d_raw:.2f} ms  (Avg: {np.mean(self.telemetry_stats['3_gpu_h2d_raw']):.2f} ms)\n"
-            f"  3b. GPU Resize+Preprocess Kernel: {dt_preproc_gpu:.2f} ms  (Avg: {np.mean(self.telemetry_stats['3b_gpu_resize_preprocess']):.2f} ms)\n"
-            f"  4. TRT GPU Core Inference:   {dt_inference:.2f} ms  (Avg: {np.mean(self.telemetry_stats['4_gpu_inference']):.2f} ms)\n"
-            f"  5. Cuda D2H Copy:            {dt_d2h:.2f} ms  (Avg: {np.mean(self.telemetry_stats['5_gpu_d2h']):.2f} ms)\n"
+            f"====== PERFORMANCE REPORT (GPU ON-CHIP DECODING) ======\n"
+            f"  OUTPUT RESOLUTION:           112x112 (NATIVE INTERLEAVED)\n"
+            f"  1. Total Asynchronous GPU:   {dt_gpu_pipeline:.2f} ms\n"
             f"  [Post-Processing Sub-steps]:\n"
-            f"     --> 6. Filter & Thresh:   {dt_filter:.2f} ms  (Avg: {np.mean(self.telemetry_stats['6_post_filter']):.2f} ms)\n"
-            f"     --> 7. OpenCV NMSBoxes:   {dt_nms:.2f} ms  (Avg: {np.mean(self.telemetry_stats['7_post_nms']):.2f} ms)\n"
-            f"     --> 8 & 9. Numba Fused:   {dt_canvas:.2f} ms  (Avg: {np.mean(self.telemetry_stats['9_post_canvas']):.2f} ms)\n"
-            f"     --> 10. HR Upsample (LUT): {dt_upsample:.2f} ms  (Avg: {np.mean(self.telemetry_stats['10_post_upsample']):.2f} ms)\n"
-            f"  11. Publish Enqueue (async): {dt_pub:.2f} ms  (Avg: {np.mean(self.telemetry_stats['11_ros_publish_enqueue']):.2f} ms)\n"
-            f"  [Async Worker] Encode+Pub:   (Avg: {avg_async_pub:.2f} ms, non sommato al totale)\n"
+            f"     --> Filter (conf thresh):  {dt_filter:.2f} ms\n"
+            f"     --> NMS:                   {dt_nms:.2f} ms\n"
+            f"     --> Mask Decode (CUDA KNL): {dt_canvas:.2f} ms\n"
+            f"     --> Publish Enqueue:       {dt_pub:.2f} ms\n"
+            f"  [Async Worker] LUT + TurboJPEG (112p): Avg: {avg_async_pub:.2f} ms\n"
             f"-----------------------------------------\n"
-            f"  TOTAL END-TO-END PIPELINE:   {dt_total_pipe:.2f} ms  (Avg: {avg_pipeline:.2f} ms) | Real FPS: {fps:.1f}\n"
+            f"  TOTAL INFERENCE TIME:        {dt_total_pipe:.2f} ms | INTERNAL FPS: {fps:.1f}\n"
             f"========================================="
         )
+
+    def _publish_worker(self):
+        color_lut = np.array([
+            [0, 255, 0],    # Class 0: Dashed Lines (Green: B=0, G=255, R=0)
+            [255, 0, 0],    # Class 1: Parking Lots (Blue in BGR: B=255, G=0, R=0)
+            [0, 0, 255],    # Class 2: Solid Lines (Red in BGR: B=0, G=0, R=255)
+            [80, 80, 80],   # Class 3: Road Surface
+            [0, 0, 0]       # Class 4: Background
+        ], dtype=np.uint8)
+
+        while rclpy.ok():
+            try:
+                item = self.pub_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            mask_overlay, stamp = item
+
+            t0 = time.perf_counter()
+            try:
+                color_frame = color_lut[mask_overlay]
+
+                encoded_img = self.jpeg_encoder.encode(
+                    color_frame,
+                    pixel_format=TJPF_BGR,
+                    quality=80
+                )
+
+                ros_mask_msg = CompressedImage()
+                ros_mask_msg.header.stamp = stamp
+                ros_mask_msg.format = "jpeg"
+                ros_mask_msg.data = encoded_img
+                self.mask_pub.publish(ros_mask_msg)
+
+            except Exception as e:
+                self.get_logger().error(f"Failed to publish native-res 112p compressed image: {str(e)}")
+
+            t1 = time.perf_counter()
+            self.telemetry_stats['async_encode_publish'].append((t1 - t0) * 1000)
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -562,13 +494,14 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info("Shutting down Lane Segmenter Node.")
+        node.get_logger().info("Shutting down node.")
     finally:
         try:
             node.destroy_node()
         except Exception:
             pass
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
