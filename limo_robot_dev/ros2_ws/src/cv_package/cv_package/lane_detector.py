@@ -28,25 +28,37 @@ class LaneDetector(Node):
         self.cuda_context = cuda.Context.get_current()
 
         self.mask_pub = self.create_publisher(CompressedImage, '/detection/lane_masks/compressed', 10)
+        self.raw_mask_pub = self.create_publisher(Image, '/detection/lane_masks/raw', 10)
         self.bridge = CvBridge()
         self.jpeg_encoder = TurboJPEG()
 
+        # Frame counter to throttle telemetry console logging
+        self.frame_counter = 0
+
+        # Best effort QoS matching typical compressed video streams
         latest_frame_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
 
+        # Changed subscription type to CompressedImage and updated topic name
         self.rgb_sub = self.create_subscription(
-            Image,
-            '/camera/color/image_raw',
+            CompressedImage,
+            '/camera/color/image_raw/compressed',
             self.image_callback,
             latest_frame_qos
         )
 
         self.window_size = 100
         self.telemetry_stats = {
-            '1_cv_bridge': deque(maxlen=self.window_size),
+            # Message timestamp-based latencies
+            '0_transport_delay': deque(maxlen=self.window_size),
+            '5_msg_age_post_inference': deque(maxlen=self.window_size),
+            '12_msg_age_final_publish': deque(maxlen=self.window_size),
+            # Execution tracking metrics
+            '1_jpeg_decode': deque(maxlen=self.window_size),
+            '2_queue_waiting_time': deque(maxlen=self.window_size),  # Added to track inference queue delay
             '4_gpu_inference': deque(maxlen=self.window_size),
             '6_post_filter': deque(maxlen=self.window_size),
             '7_post_nms': deque(maxlen=self.window_size),
@@ -196,7 +208,7 @@ class LaneDetector(Node):
         for binding in self.engine:
             shape = self.engine.get_binding_shape(binding)
             size = trt.volume(shape)
-            dtype = trt.nptype(self.engine.get_binding_dtype(binding))
+            dtype = trt.nptype(self.engine.get_binding_dtype(binding)) 
 
             host_mem = cuda.pagelocked_empty(size, dtype)
             device_mem = cuda.mem_alloc(host_mem.nbytes)
@@ -218,7 +230,6 @@ class LaneDetector(Node):
         self.raw_input_shape = None
         self.host_raw_pinned = None
 
-        # Pre-allocate static GPU execution contexts for variables after NMS
         self.MAX_BOXES = 64
         self.gpu_coeffs = cuda.mem_alloc(self.MAX_BOXES * 32 * 4)
         self.gpu_class_ids = cuda.mem_alloc(self.MAX_BOXES * 4)
@@ -227,21 +238,19 @@ class LaneDetector(Node):
         self.gpu_x2 = cuda.mem_alloc(self.MAX_BOXES * 4)
         self.gpu_y2 = cuda.mem_alloc(self.MAX_BOXES * 4)
         
-        # Pinned 12KB host container for fast asynchronous PCIe download
         self.gpu_mask_out = cuda.mem_alloc(112 * 112)
         self.host_mask_out = cuda.pagelocked_empty((112, 112), dtype=np.uint8)
 
     def image_callback(self, msg):
-        t_cv_bridge_start = time.perf_counter()
-        try:
-            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        except Exception as e:
-            self.get_logger().error(f"Failed to convert image: {str(e)}")
-            return
-            
-        cv_time = (time.perf_counter() - t_cv_bridge_start) * 1000
-        self.telemetry_stats['1_cv_bridge'].append(cv_time)
+        """
+        Producer Callback: Lightweight forwarding of the raw message to minimize GIL contention.
+        """
+        t_now_ros = self.get_clock().now().nanoseconds / 1e9
+        t_msg_ros = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        transport_delay = (t_now_ros - t_msg_ros) * 1000.0
+        self.telemetry_stats['0_transport_delay'].append(transport_delay)
 
+        # Drop oldest frame if queue is full to ensure real-time operation
         if self.inference_queue.full():
             try:
                 self.inference_queue.get_nowait()
@@ -249,7 +258,9 @@ class LaneDetector(Node):
                 pass
         
         try:
-            self.inference_queue.put_nowait((cv_image, msg.header.stamp))
+            time_entering = time.perf_counter()
+            # Push raw message instead of decoding it here on the main ROS thread
+            self.inference_queue.put_nowait((msg, time_entering))
         except queue.Full:
             pass
 
@@ -259,11 +270,28 @@ class LaneDetector(Node):
         while rclpy.ok():
             try:
                 item = self.inference_queue.get(timeout=0.5)
+                time_exiting = time.perf_counter()
             except queue.Empty:
                 continue
 
-            cv_image, stamp = item
-            self._process_frame(cv_image, stamp)
+            # Unpack raw message payload
+            msg, time_entering = item
+            
+            queue_delay = (time_exiting - time_entering) * 1000.0
+            self.telemetry_stats['2_queue_waiting_time'].append(queue_delay)
+
+            # Perform JPEG decoding safely inside the background worker thread
+            t_decode_start = time.perf_counter()
+            try:
+                cv_image = self.jpeg_encoder.decode(msg.data, pixel_format=TJPF_BGR)
+            except Exception as e:
+                self.get_logger().error(f"TurboJPEG inbound decoding failed: {str(e)}")
+                continue
+                
+            decode_time = (time.perf_counter() - t_decode_start) * 1000
+            self.telemetry_stats['1_jpeg_decode'].append(decode_time)
+
+            self._process_frame(cv_image, msg.header.stamp)
 
         self.cuda_context.pop()
 
@@ -280,6 +308,7 @@ class LaneDetector(Node):
                 self.host_raw_pinned = cuda.pagelocked_empty((h, w, 3), dtype=np.uint8)
 
             np.copyto(self.host_raw_pinned, cv_image)
+
             cuda.memcpy_htod_async(self.device_raw_input, self.host_raw_pinned, self.stream)
 
             out_h, out_w = 448, 448
@@ -301,7 +330,6 @@ class LaneDetector(Node):
 
             self.trt_context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
 
-            # CRITICAL OPTIMIZATION: Extract structural layouts and leave Proto inside the GPU VRAM
             proto_info = None
             pred_info = None
             for out in self.output_info:
@@ -309,7 +337,6 @@ class LaneDetector(Node):
                     proto_info = out
                 else:
                     pred_info = out
-                    # Download only the bounding boxes predictions to Host
                     cuda.memcpy_dtoh_async(out['host'], out['device'], self.stream)
 
             self.stream.synchronize()
@@ -367,10 +394,8 @@ class LaneDetector(Node):
 
                     masks_coeffs = filtered_preds[:, 4 + num_classes: 4 + num_classes + 32]
 
-                    # --- GPU MASK DECODING ROUTINE ---
                     num_boxes = min(len(filtered_preds), self.MAX_BOXES)
                     
-                    # Upload small post-processed configuration vectors back to GPU
                     cuda.memcpy_htod_async(self.gpu_coeffs, masks_coeffs[:num_boxes].astype(np.float32), self.stream)
                     cuda.memcpy_htod_async(self.gpu_class_ids, filtered_class_ids[:num_boxes].astype(np.int32), self.stream)
                     cuda.memcpy_htod_async(self.gpu_x1, x1[:num_boxes].astype(np.int32), self.stream)
@@ -378,7 +403,6 @@ class LaneDetector(Node):
                     cuda.memcpy_htod_async(self.gpu_x2, x2[:num_boxes].astype(np.int32), self.stream)
                     cuda.memcpy_htod_async(self.gpu_y2, y2[:num_boxes].astype(np.int32), self.stream)
 
-                    # Trigger parallel decoding matrix multiplication inside GPU
                     dec_block = 256
                     dec_grid = int((112 * 112 + dec_block - 1) / dec_block)
                     self.gpu_decode_kernel(
@@ -393,7 +417,6 @@ class LaneDetector(Node):
                         stream=self.stream
                     )
 
-                    # Async download of the tiny 12KB matrix layout
                     cuda.memcpy_dtoh_async(self.host_mask_out, self.gpu_mask_out, self.stream)
                     self.stream.synchronize()
                     mask_overlay = self.host_mask_out
@@ -421,6 +444,12 @@ class LaneDetector(Node):
         dt_gpu_pipeline = (t_gpu_done - t_start) * 1000
         dt_total_pipe = (t_end - t_start) * 1000
 
+        # Calculate message age right after inference pipeline completes
+        t_now_post_inf = self.get_clock().now().nanoseconds / 1e9
+        t_msg_post_inf = stamp.sec + stamp.nanosec * 1e-9
+        msg_age_post_inference = (t_now_post_inf - t_msg_post_inf) * 1000.0
+        self.telemetry_stats['5_msg_age_post_inference'].append(msg_age_post_inference)
+
         self.telemetry_stats['4_gpu_inference'].append(dt_gpu_pipeline)
         self.telemetry_stats['6_post_filter'].append(dt_filter)
         self.telemetry_stats['7_post_nms'].append(dt_nms)
@@ -428,31 +457,47 @@ class LaneDetector(Node):
         self.telemetry_stats['11_ros_publish_enqueue'].append(dt_pub)
         self.telemetry_stats['total_pipeline'].append(dt_total_pipe)
 
-        avg_pipeline = np.mean(self.telemetry_stats['total_pipeline'])
-        fps = 1000.0 / avg_pipeline if avg_pipeline > 0 else 0.0
-        avg_async_pub = np.mean(self.telemetry_stats['async_encode_publish']) if len(self.telemetry_stats['async_encode_publish']) > 0 else 0.0
+        # Throttled logging block to reduce console write I/O overhead
+        self.frame_counter += 1
+        if self.frame_counter % 30 == 0:
+            avg_pipeline = np.mean(self.telemetry_stats['total_pipeline'])
+            fps = 1000.0 / avg_pipeline if avg_pipeline > 0 else 0.0
+            avg_async_pub = np.mean(self.telemetry_stats['async_encode_publish']) if len(self.telemetry_stats['async_encode_publish']) > 0 else 0.0
+            avg_decode = np.mean(self.telemetry_stats['1_jpeg_decode']) if len(self.telemetry_stats['1_jpeg_decode']) > 0 else 0.0
+            
+            avg_transport_delay = np.mean(self.telemetry_stats['0_transport_delay'])
+            avg_queue_wait = np.mean(self.telemetry_stats['2_queue_waiting_time'])
+            avg_age_post_inference = np.mean(self.telemetry_stats['5_msg_age_post_inference'])
+            avg_final_e2e_age = np.mean(self.telemetry_stats['12_msg_age_final_publish']) if len(self.telemetry_stats['12_msg_age_final_publish']) > 0 else 0.0
 
-        self.get_logger().info(
-            f"\n"
-            f"====== PERFORMANCE REPORT (GPU ON-CHIP DECODING) ======\n"
-            f"  OUTPUT RESOLUTION:           112x112 (NATIVE INTERLEAVED)\n"
-            f"  1. Total Asynchronous GPU:   {dt_gpu_pipeline:.2f} ms\n"
-            f"  [Post-Processing Sub-steps]:\n"
-            f"     --> Filter (conf thresh):  {dt_filter:.2f} ms\n"
-            f"     --> NMS:                   {dt_nms:.2f} ms\n"
-            f"     --> Mask Decode (CUDA KNL): {dt_canvas:.2f} ms\n"
-            f"     --> Publish Enqueue:       {dt_pub:.2f} ms\n"
-            f"  [Async Worker] LUT + TurboJPEG (112p): Avg: {avg_async_pub:.2f} ms\n"
-            f"-----------------------------------------\n"
-            f"  TOTAL INFERENCE TIME:        {dt_total_pipe:.2f} ms | INTERNAL FPS: {fps:.1f}\n"
-            f"========================================="
-        )
+            self.get_logger().info(
+                f"\n"
+                f"====== PERFORMANCE & LATENCY REPORT ======\n"
+                f"  [TIMESTAMP-BASED TRUE LATENCY]:\n"
+                f"     --> Camera to Node Ingress (Bridge delay): {avg_transport_delay:.2f} ms\n"
+                f"     --> Frame Age Post-Inference:             {avg_age_post_inference:.2f} ms\n"
+                f"     --> Total End-to-End Age (Post-Publish):  {avg_final_e2e_age:.2f} ms\n"
+                f"-----------------------------------------\n"
+                f"  [ISOLATED NODE PROCESSING TIMES]:\n"
+                f"     --> Inbound JPEG Decode (CPU):            {avg_decode:.2f} ms\n"
+                f"     --> Thread Queue Waiting Time:            {avg_queue_wait:.2f} ms\n"
+                f"     --> Total Asynchronous GPU Execution:     {dt_gpu_pipeline:.2f} ms\n"
+                f"     [Post-Processing Sub-steps]:\n"
+                f"        --> Filter (conf thresh):               {dt_filter:.2f} ms\n"
+                f"        --> NMS:                                {dt_nms:.2f} ms\n"
+                f"        --> Mask Decode (CUDA KNL):             {dt_canvas:.2f} ms\n"
+                f"        --> Publish Enqueue:                    {dt_pub:.2f} ms\n"
+                f"     --> [Async Worker] LUT + TurboJPEG (112p): {avg_async_pub:.2f} ms\n"
+                f"-----------------------------------------\n"
+                f"  TOTAL NODE INFERENCE TIME:        {dt_total_pipe:.2f} ms | INTERNAL FPS: {fps:.1f}\n"
+                f"========================================="
+            )
 
     def _publish_worker(self):
         color_lut = np.array([
-            [0, 255, 0],    # Class 0: Dashed Lines (Green: B=0, G=255, R=0)
-            [255, 0, 0],    # Class 1: Parking Lots (Blue in BGR: B=255, G=0, R=0)
-            [0, 0, 255],    # Class 2: Solid Lines (Red in BGR: B=0, G=0, R=255)
+            [0, 255, 0],    # Class 0: Dashed Lines (Green)
+            [255, 0, 0],    # Class 1: Parking Lots (Blue in BGR)
+            [0, 0, 255],    # Class 2: Solid Lines (Red in BGR)
             [80, 80, 80],   # Class 3: Road Surface
             [0, 0, 0]       # Class 4: Background
         ], dtype=np.uint8)
@@ -468,6 +513,10 @@ class LaneDetector(Node):
             t0 = time.perf_counter()
             try:
                 color_frame = color_lut[mask_overlay]
+
+                ros_raw_msg = self.bridge.cv2_to_imgmsg(color_frame, encoding='bgr8')
+                ros_raw_msg.header.stamp = stamp
+                self.raw_mask_pub.publish(ros_raw_msg)
 
                 encoded_img = self.jpeg_encoder.encode(
                     color_frame,
@@ -486,6 +535,12 @@ class LaneDetector(Node):
 
             t1 = time.perf_counter()
             self.telemetry_stats['async_encode_publish'].append((t1 - t0) * 1000)
+
+            # Calculate absolute final latency from physical camera capture to publication emission
+            t_now_final = self.get_clock().now().nanoseconds / 1e9
+            t_msg_final = stamp.sec + stamp.nanosec * 1e-9
+            msg_age_final = (t_now_final - t_msg_final) * 1000.0
+            self.telemetry_stats['12_msg_age_final_publish'].append(msg_age_final)
 
 
 def main(args=None):

@@ -6,6 +6,7 @@ from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
+import time
 
 class BirdPerspective(Node):
 
@@ -27,29 +28,48 @@ class BirdPerspective(Node):
         # Kernel to dilate pixels in BEV (3x3 or 5x5 depending on how thick you want them to appear)
         self.kernel_inflate = np.ones((3, 3), dtype=np.uint8)
 
+        self.frame_count = 0
+        self.total_latency_accumulated_ms = 0.0
+
     def camera_info_callback(self, msg):
         # Extract intrinsic parameters
         self.fx = msg.k[0]
         self.fy = msg.k[4]
         self.cx = msg.k[2]
         self.cy = msg.k[5]
+        self.get_logger().debug('Camera info received.', throttle_duration_sec=5.0)
 
     def depth_callback(self, msg):
         # Ensure depth is processed as float32 in meters
-        tmp_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+        try:
+            tmp_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+        except Exception as e:
+            self.get_logger().error(f'Failed to convert depth image: {e}')
+            return
+
         if tmp_depth.dtype == np.uint16:
             self.depth_img = tmp_depth.astype(np.float32) / 1000.0
         else:
             self.depth_img = tmp_depth
 
+        self.get_logger().debug('Depth image received.', throttle_duration_sec=5.0)
+
     def rgb_callback(self, msg):
+        start_time = time.perf_counter()
+        self.frame_count += 1
+
         # SAFETY CHECK: Only proceed if we have all necessary data
         if self.depth_img is None or self.fx is None:
-            self.get_logger().warn('Waiting for Depth and CameraInfo...', throttle_duration_sec=2.0)
+            self.get_logger().warn('Waiting for Depth and CameraInfo; skipping BEV frame.', throttle_duration_sec=2.0)
             return
         
-        self.get_logger().info('Processing new RGB frame...')
-        rgb_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        try:
+            rgb_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except Exception as e:
+            self.get_logger().error(f'Failed to convert RGB image: {e}')
+            return
+
+        self.get_logger().debug(f'Processing RGB frame #{self.frame_count}...', throttle_duration_sec=2.0)
 
         # --- CRITICAL CORRECTION: IDENTIFY ONLY USABLE PIXELS ---
         # Find where the image is NOT black (at least one BGR channel is greater than zero)
@@ -59,7 +79,7 @@ class BirdPerspective(Node):
         v_indices, u_indices = np.where(valid_color_mask)
         
         if len(u_indices) == 0:
-            # If the input image is completely empty, publish an empty frame directly
+            self.get_logger().warn('Input frame contains no non-black pixels; publishing empty BEV.', throttle_duration_sec=2.0)
             empty_bev = np.zeros((600, 600, 3), dtype=np.uint8)
             bird_msg = self.bridge.cv2_to_imgmsg(empty_bev, encoding='bgr8')
             bird_msg.header = msg.header
@@ -80,6 +100,7 @@ class BirdPerspective(Node):
         colors = colors[valid_depth]
 
         if len(u) == 0:
+            self.get_logger().warn('No valid depth-filtered points after filtering; skipping BEV projection.', throttle_duration_sec=2.0)
             return
 
         # Back-projection to Camera Frame (For valid pixels only!)
@@ -130,7 +151,16 @@ class BirdPerspective(Node):
         # --- APPLY MORPHOLOGICAL DILATION TO INFLATE PIXELS ---
         bev_img = cv2.dilate(bev_img, self.kernel_inflate, iterations=1)
 
-        # Publish result
+        total_latency_ms = (time.perf_counter() - start_time) * 1000
+        self.total_latency_accumulated_ms += total_latency_ms
+        avg_total_latency_ms = self.total_latency_accumulated_ms / self.frame_count
+        fps = 1000.0 / avg_total_latency_ms if avg_total_latency_ms > 0 else 0.0
+
+        self.get_logger().info(
+            f'BEV frame #{self.frame_count} published with {len(u)} valid points in {total_latency_ms:.2f} ms (avg internal FPS: {fps:.1f}).',
+            throttle_duration_sec=2.0
+        )
+
         bird_msg = self.bridge.cv2_to_imgmsg(bev_img, encoding='bgr8')
         bird_msg.header = msg.header
         self.bird_pub.publish(bird_msg)

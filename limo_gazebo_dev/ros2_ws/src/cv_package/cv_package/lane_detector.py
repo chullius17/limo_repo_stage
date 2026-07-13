@@ -49,6 +49,9 @@ class LaneDetector(Node):
             self.ort_session = None
             return
         
+        self.frame_count = 0
+        self.total_latency_accumulated_ms = 0.0
+
         self.get_logger().info("Clean & Fast 4-Class Segmenter Node started!")
 
     def image_callback(self, msg):
@@ -191,6 +194,12 @@ class LaneDetector(Node):
             return
 
         t3 = time.perf_counter()
+        total_latency_ms = (t3 - t0) * 1000
+
+        self.frame_count += 1
+        self.total_latency_accumulated_ms += total_latency_ms
+        avg_total_latency_ms = self.total_latency_accumulated_ms / self.frame_count
+        fps = 1000.0 / avg_total_latency_ms if avg_total_latency_ms > 0 else 0.0
 
         self.get_logger().info(
             f"[TIME] Blend: {(tb1-tb0)*1000:.2f} ms | "
@@ -198,8 +207,8 @@ class LaneDetector(Node):
             f"Pub mask: {(tp1-tp0)*1000:.2f} ms | "
             f"Overlay->ROS: {(tm2-tp1)*1000:.2f} ms | "
             f"Pub overlay: {(tp3-tp2)*1000:.2f} ms | "
-            f"TOTAL: {(t3-t0)*1000:.2f} ms | "
-            f"FPS: {1.0/(t3-t0):.1f}"
+            f"TOTAL: {total_latency_ms:.2f} ms | "
+            f"INTERNAL FPS: {fps:.1f}"
         )
 
 def main(args=None):
